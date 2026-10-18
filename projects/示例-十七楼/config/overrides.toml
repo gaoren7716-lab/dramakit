@@ -1,0 +1,11 @@
+# 本项目阈值覆盖
+# 优先级：本文件 > 档位（[live]）> 全局基线
+# 只写与全局不同的项，未写的沿用全局。
+
+shot_profile = "live"     # 真人实拍档
+
+[single]
+target_duration_s = 60    # 一分钟单集
+duration_tolerance = 0.15
+shots_min = 6
+shots_max = 12

@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 打包产物
+dist/
+build/
+*.exe
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 成片与素材（体积大，不入库）
+**/*.mp4
+**/*.mov
+**/*.wav
+**/*.png
+**/*.jpg
