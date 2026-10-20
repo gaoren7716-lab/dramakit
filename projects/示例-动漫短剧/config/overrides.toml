@@ -1,0 +1,7 @@
+# 动漫短剧形态 · 单集 120 秒
+form = "anime"
+[single]
+target_duration_s = 120
+duration_tolerance = 0.15
+shots_min = 22
+shots_max = 46

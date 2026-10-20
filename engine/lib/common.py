@@ -44,35 +44,95 @@ RAW = _load(CONFIG_FILE)
 CONST = {"drama": RAW}
 
 
-def apply_shot_profile(const: dict, profile: str = "ai") -> dict:
-    """按镜头语言档位生成常数副本。
+FORMS = ("live_action", "anime", "motion_comic", "static_comic")
+PROFILES = ("ai", "live")
 
-    `[shot] / [single] / [quality]` 是 **AI 生成档**的基线。
-    `[live.*]` 只写与 AI 档的差异项，按表名分组逐表覆盖。
+# 形态别名：旧项目写 comic，等同 motion_comic。保留是为了不让既有项目失效。
+FORM_ALIAS = {"comic": "motion_comic", "live": "live_action", "ai": "live_action"}
 
-    为什么要分档：**两档判据方向是反的**。AI 生成单镜 3-4 秒最稳（再长画面崩、
-    动作漂），真人实拍相反——长镜省机位、表演连贯，一个中景长镜能把整段对话
-    一次演完。用同一把尺子量两种形态，必然一边被误判。
+# 形态专属要替换的表。live_action 没有专属块，直接用全局基线。
+# panel 是"格"（漫剧/静态漫独有），asset 是资产台账（动画/漫画独有），
+# hook 是秒级锚点表（各形态爆破节奏不同，容差要跟着变）。
+FORM_TABLES = ("shot", "single", "quality", "panel", "asset", "hook")
+
+# 哪些形态有"格"（一组格完成一个起承转合）——只有两种漫。
+# 动漫短剧是连续动画，用影视景别与视频交付，不算"格"形态。
+PANEL_FORMS = ("motion_comic", "static_comic")
+# 哪些形态是静态图（无连续视频）——决定了预算/重抽口径
+FRAME_FORMS = ("motion_comic", "static_comic")
+
+
+def normalize_form(form: str | None) -> str:
+    """把形态名归一化：别名解析 + 未知值退回 live_action。"""
+    f = str(form or "").strip()
+    f = FORM_ALIAS.get(f, f)
+    return f if f in FORMS else "live_action"
+
+
+def normalize_profile(profile: str | None) -> str:
+    p = str(profile or "").strip()
+    return p if p in PROFILES else "ai"
+
+
+def apply_form_profile(const: dict, form: str = "live_action",
+                       profile: str = "ai") -> dict:
+    """按「形态 + 档位」生成常数副本。
+
+    两个维度是**正交**的，别混：
+      - **形态（form）**：画面从哪来。live_action 真人/AI 写实视频、
+        anime 动漫短剧（连续动画）、motion_comic 动态漫、static_comic 静态漫。
+        换的是媒介——有没有连续视频、对白走配音还是走气泡、要不要资产台账。
+      - **档位（profile）**：ai 生成 vs live 真人实拍。
+        换的只是镜头语言（单镜多长最稳、长镜算不算省机位）。
+
+    所以形态决定"用哪套表"，档位只在这套表上做微调。静态漫/动态漫
+    与是不是真人无关（画面都是静态图），档位对它只影响 live 覆盖项里
+    显式写了的那些键。
+
+    优先级：项目覆盖 > 形态 > 档位 > 全局基线。
     """
+    # ★ 必须先真正复制 drama 表。deep_merge(const, {}) 只复制顶层：
+    # out["drama"] 与 const["drama"] 仍是同一个对象，写 form 会污染全局常数，
+    # 导致上一次调用选的形态泄漏到下一次（实测：跑过一次 comic，之后默认形态变成 comic）。
     out = deep_merge(const, {})
-    d = out["drama"]
-    if profile == "live":
-        live = d.get("live") or {}
-        patch = {}
-        for table in ("shot", "single", "quality"):
-            if isinstance(live.get(table), dict) and live[table]:
-                patch[table] = live[table]
+    d = deep_merge(out["drama"], {})
+    out["drama"] = d
+    frm = normalize_form(form)
+    prof = normalize_profile(profile)
+
+    # 1) 形态：按 <form>.<table> 覆盖基线三表 + 形态专属表
+    form_block = d.get(frm) or {}
+    if frm != "live_action" and form_block:
+        patch = {t: form_block[t] for t in FORM_TABLES
+                 if isinstance(form_block.get(t), dict) and form_block[t]}
         d = deep_merge(d, patch)
-        out["drama"] = d
-    d["_profile"] = profile if profile in ("ai", "live") else "ai"
+    # 形态决定是否存在 panel / asset：没有就退回空字典而非删键，
+    # 下游 len()/get() 不会炸。
+    for t in ("panel", "asset"):
+        if t not in d or not isinstance(d.get(t), dict):
+            d.setdefault(t, {})
+
+    # 2) 档位微调：只认 live.* 里按表名分组的差异项
+    if prof == "live":
+        live = d.get("live") or {}
+        lp = {t: live[t] for t in ("shot", "single", "quality", "hook")
+              if isinstance(live.get(t), dict) and live[t]}
+        if lp:
+            d = deep_merge(d, lp)
+
+    d["form"] = frm
+    d["_profile"] = prof
+    out["drama"] = d
     return out
 
 
-def constants_for(proj=None, profile: str | None = None) -> dict:
-    """项目级常数 = 全局 + 档位 + <项目>/config/overrides.toml。
 
-    顺序不能反：**项目覆盖永远最高**。档位只是"这类形态的默认区间"，
-    作品自己的特殊约定（这部长镜更多、允许 12 秒）必须压得住档位。
+def constants_for(proj=None, profile: str | None = None,
+                  form: str | None = None) -> dict:
+    """项目级常数 = 全局 + 形态 + 档位 + <项目>/config/overrides.toml。
+
+    顺序不能反：**项目覆盖永远最高**。形态与档位只是"这类作品的默认区间"，
+    作品自己的特殊约定（这部长镜更多、允许 12 秒）必须压得住它们。
     """
     over = {}
     if proj is not None:
@@ -84,17 +144,71 @@ def constants_for(proj=None, profile: str | None = None) -> dict:
             except Exception:
                 over = {}
 
-    prof = (profile
-            or over.get("shot_profile")
-            or (over.get("drama") or {}).get("shot_profile")
-            or RAW.get("shot_profile") or "ai")
-    # overrides 可能直接写 [shot] / [single]，也可能沿用 [drama.*]，两种都认
-    base = apply_shot_profile(CONST, prof)
-    flat = {k: v for k, v in over.items() if k != "drama"}
     nested = over.get("drama") or {}
-    out = deep_merge(base, {"drama": deep_merge(flat, nested)}) if over else base
+    flat = {k: v for k, v in over.items() if k != "drama"}
+    merged_over = deep_merge(flat, nested)
+
+    prof = normalize_profile(
+        profile or merged_over.get("shot_profile")
+        or RAW.get("shot_profile") or "ai")
+    frm = normalize_form(
+        form or merged_over.get("form")
+        or RAW.get("form") or "live_action")
+
+    base = apply_form_profile(CONST, frm, prof)
+    out = deep_merge(base, {"drama": merged_over}) if merged_over else base
     out["_has_overrides"] = bool(over)
+    out["_form"] = frm
+    out["_profile"] = prof
     return out
+
+
+# ------------------------------------------------------------
+# 平台 / 模型 / 合规规格
+# ------------------------------------------------------------
+
+def platform_for(const: dict | None = None, name: str | None = None) -> dict:
+    """取平台规格表（画幅 / 时长档 / 安全区）。
+
+    优先级：显式 name > 项目/全局 `[platform]` 键 > `[platform.default]`。
+    表里没有的键退回 default 的对应值，避免下游 KeyError。
+    """
+    d = (const or CONST)["drama"]
+    sel = d.get("select") or {}
+    key = str(name or sel.get("platform") or "default").strip()
+    tbl = (d.get("platform") or {})
+    spec = deep_merge(tbl.get("default") or {}, tbl.get(key) or {})
+    if not spec:
+        spec = {"aspect": "9:16", "duration_band": [30, 180]}
+    return spec
+
+
+def model_for(const: dict | None = None, name: str | None = None) -> dict:
+    """取生成后端能力表（单镜时长上限 / 提示词字数 / 参考图额度）。
+
+    **超限必须拒绝，不得截断后调上游**——本函数只负责给出上限，
+    是否拒绝由调用方（scan.check_model_limits）判定。
+    """
+    d = (const or CONST)["drama"]
+    sel = d.get("select") or {}
+    key = str(name or sel.get("model") or "default").strip()
+    tbl = (d.get("model") or {})
+    return deep_merge(tbl.get("default") or {}, tbl.get(key) or {})
+
+
+def compliance_for(const: dict | None = None) -> dict:
+    """取合规表。合并 default 兜底，缺表时返回一份保守默认。"""
+    d = (const or CONST)["drama"]
+    base = {
+        "aigc_label_required": True,
+        "aigc_label_text": "本片由 AI 生成合成",
+        "aigc_label_in_delivery": True,
+        "minors_protection": True,
+        "minors_terms": [],
+        "sensitive_terms": [],
+        "forbidden_terms": [],
+    }
+    return deep_merge(base, d.get("compliance") or {})
 
 
 def find_project_root(path, levels: int = 4):

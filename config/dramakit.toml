@@ -6,12 +6,34 @@
 
 [meta]
 name = "短剧工坊"
-version = "0.1.0"
+version = "0.3.0"
 python = ">=3.11"
+
+# ------------------------------------------------------------
+# 两个正交维度 —— 别混
+# ------------------------------------------------------------
+# **形态（form）**：画面从哪来。换的是媒介，不是题材。
+#   live_action  真人与 AI 写实视频短剧（连续视频，有人演或有"表演"）
+#   anime        动漫短剧（连续动画，cel-shading，角色靠四视图锁）
+#   motion_comic 动态漫（静态帧 + 推拉摇移，Ken Burns）
+#   static_comic 静态漫 / 条漫（静态格，无运镜，气泡 + 停留）
+#
+# **档位（profile）**：镜头语言，只管单镜多长最稳、长镜算不算省机位。
+#   ai   生成档（AI 出片，单镜 3-4 秒最稳）
+#   live 真人实拍档（长镜省机位，一个中景长镜演完整段对话）
+#
+# 覆盖优先级：**项目 overrides > 形态 > 档位 > 全局基线**，顺序不能反。
+# 别名：comic = motion_comic（旧项目兼容）
+
+# 当前项目默认选用哪个规格（可被项目 overrides 的 [select] 覆盖）
+# platform → [platform.*] 表；model → [model.*] 表
+[select]
+platform = "default"
+model = "default"
 
 
 # ------------------------------------------------------------
-# 单集完结
+# 单集完结（live_action 基线）
 # ------------------------------------------------------------
 [single]
 target_duration_s = 140     # 单集目标总时长（秒）
@@ -36,7 +58,7 @@ major_climax_every = 30     # 每 N 集一个大高潮
 
 
 # ------------------------------------------------------------
-# 镜头语言（AI 生成档基线）
+# 镜头语言（live_action · AI 生成档基线）
 # ------------------------------------------------------------
 [shot]
 sec_min = 2                 # 单镜最短时长
@@ -53,10 +75,44 @@ reaction_max_sec = 3        # 纯画面情绪镜最长时长
 # ------------------------------------------------------------
 [quality]
 fixed_ratio_min = 0.65          # 固定镜头占比下限
-close_medium_ratio_min = 0.60   # 近景 + 中景占比下限
+close_medium_ratio_min = 0.60   # 近景 + 中景占比下限（视频形态按景别名取，漫剧按格名取）
 dialogue_ratio_min = 0.40       # 有台词镜占比下限
 dialogue_ratio_max = 0.65       # 有台词镜占比上限
-hook_per_seconds = 20           # 每 N 秒至少一个钩子点
+hook_per_seconds = 20           # 均匀窗口：每 N 秒至少一个钩子点（兜底判据）
+
+
+# ------------------------------------------------------------
+# 秒级钩子锚点（爆破点）—— 比"均匀窗口"更接近真实爆款节奏
+# ------------------------------------------------------------
+# 均匀窗口（hook_per_seconds）管的是"不许有长段平淡"，锚点管的是
+# "该炸的时候必须炸"。真实爆款的节奏不是均匀撒钩子，是**在固定秒数上
+# 集中爆破**（红果低线爆款的七个常见爆破点）。
+#
+# anchors：锚点秒表。0 = 第一镜必须是对抗开场（不许铺垫）。
+# anchor_gap_s：每个锚点允许的容差——到该秒为止，最后一个钩子距它
+#   不得超过这个数；从未出现过钩子也算未命中。
+# 超出本片总时长的锚点自动忽略（60 秒的片子不查 180s 锚点，
+# 不该为够不着的秒数误报）。
+# anchor_required = false 可整表关掉（比如实验性片段）。
+[hook]
+anchors = [0, 30, 60, 90, 120, 150, 180]
+anchor_gap_s = 15
+anchor_required = true
+
+
+# ------------------------------------------------------------
+# 生成失败模式分类 —— 能力上限之外，还要知道"会怎么失败"
+# ------------------------------------------------------------
+# [model.*] 说"最多能到哪"，本表说"超了会以什么形态失败、该怎么办"。
+# 只有 detectable = true 的模式能被本系统机械预判；false 的只在
+# 报告里列出，让人知道"这类失败出现了别怪剧本"。
+# 注意：键名是中文，必须加引号——TOML 的裸键只认 A-Za-z0-9_-。
+[failure.modes]
+"时长超"   = {trigger = "单镜秒数超过该后端 max_shot_sec", fix = "显式拆镜，不许截断后发上游", detectable = true}
+"字数超"   = {trigger = "单镜提示词超过 max_prompt_chars", fix = "删修饰词，只留主体、动作、景别", detectable = true}
+"参考图超" = {trigger = "单镜参考图超过 ref_images_max", fix = "减到额度内，超了脸会漂", detectable = true}
+"审核"     = {trigger = "平台审核拦截（词面/画面触发，事前不可完全预判）", fix = "换表述，按 compliance 表换掉近义说法", detectable = false}
+"网络"     = {trigger = "生成请求超时或断流", fix = "重试不超过 max_retry 次，仍失败即停，不硬凑", detectable = false}
 
 
 # ------------------------------------------------------------
@@ -93,6 +149,368 @@ hook_window_s = 6
 [live.quality]
 fixed_ratio_min = 0.65  # 真人运镜偏固定
 
+[live.hook]
+anchor_gap_s = 20       # 真人长镜省机位，一个中景长镜能演完整段对话，
+                        # 锚点容差比 AI 档宽——拿 AI 的秒级密度卡真人是用反尺子
+
+
+# ------------------------------------------------------------
+# 动漫短剧（anime）：连续动画
+# ------------------------------------------------------------
+# **动漫短剧 ≠ 漫剧。** 它是有连续动作的动画，不是静态帧推拉。
+# 与真人/AI 写实视频的差别在"什么会崩"：
+#   - AI 写实视频怕的是**画面崩、动作漂**（单镜 8 秒上限）
+#     动漫是**画出来的**，没有稳定性上限，单镜可以更长；
+#     但作画有**张数预算**，动作镜（打斗/跑动）单镜越长越贵，
+#     所以"核心镜长"的意义从"最稳"变成"最经济"。
+#   - 一致性靠**角色四视图 + 上色指定表**锁线条与配色，不是靠"脸像不像"。
+#   - 有**定格/关键帧**语言：情绪靠定格 + 构图，不靠演员微表情。
+#
+# 用法：项目 overrides 写 form = "anime"，或 `dramakit scan --form anime`。
+[anime]
+note = "动漫短剧：连续动画，作画约束替代稳定性约束，角色靠四视图锁"
+
+[anime.shot]
+sec_min = 1.5           # 动画可以很短，一个定格就是 1.5 秒
+sec_max = 12            # 画出来的没有"崩"的问题，长镜上限更宽
+core_sec_min = 2.5      # 核心镜长 2.5-5 秒：经济区（少画几张，动作接得上）
+core_sec_max = 5
+core_ratio_min = 0.50
+long_take_sec = 6       # 长镜阈值：≥ 此值必须含台词或画面事件
+reaction_max_sec = 4    # 定格情绪格
+
+[anime.single]
+target_duration_s = 120
+duration_tolerance = 0.15
+shots_min = 22
+shots_max = 46
+hook_window_s = 3       # 开场同样紧，但动漫可以用一个强构图定格顶住
+
+[anime.quality]
+fixed_ratio_min = 0.45      # 动画运镜可以更多（推摇、跟镜是常规语言）
+close_medium_ratio_min = 0.60
+dialogue_ratio_min = 0.35
+dialogue_ratio_max = 0.70
+hook_per_seconds = 18
+
+[anime.hook]
+anchor_gap_s = 12       # 动画节奏比真人快、比 AI 写实稍慢，容差取中
+
+# 动漫专用：作画与角色一致性
+[anime.asset]
+char_views = 4                  # 角色参考图：四视图（正/侧/背/表情）
+color_sheet_required = true     # 必须有上色指定表，否则同一角色跨镜会换色
+ref_per_shot_max = 3            # 单镜最多引用几张参考图
+consistency_check = ["角色", "服装", "场景", "道具"]
+style_anchor_required = true    # 全局风格锚点（防跨镜画风漂移）
+# 注：动漫短剧用**影视景别**（近景/中景/特写），不是"格"——
+# 它是有连续动作的动画，交付仍是视频列头。[anime.asset] 是资产台账，
+# 与漫剧的"格表"不是一回事。
+
+
+# ------------------------------------------------------------
+# 漫剧（comic）＝ 动态漫 —— 静态帧 + 推拉摇移
+# ------------------------------------------------------------
+# **漫剧不是"用动画素材的短剧"，是另一种媒介。** 判据方向与两档视频都不同：
+#
+#   - 画面来源是**静态帧 + 推拉摇移**（Ken Burns），不是连续视频。
+#     没有"动作会漂"的问题，所以单镜可以比 AI 写实档更短、切换更频；
+#     但也没有表演，情绪全靠画面信息量与节奏。
+#   - 对白走**气泡**，不配音。气泡有物理容量，字数超了就装不下——
+#     这是硬约束，不是风格偏好。
+#   - **角色一致性是漫剧的第一痛点**。真人换演员观众认得脸，漫剧换一张脸
+#     观众只觉"哪里不对"但说不出，直接划走。所以漫剧必须登记资产
+#     （角色四视图 / 场景圣经 / 表情服装道具枚举），跨镜漂移是主要事故。
+#   - 存在"格"的概念：一组四格完成一个起承转合，节拍粒度比"镜"粗一级。
+#
+# 用法：项目 overrides 写 form = "comic"（或 motion_comic）。
+[motion_comic]
+note = "漫剧（动态漫）：静态帧+推拉、气泡对白、资产一致性优先"
+
+[motion_comic.shot]
+sec_min = 1.5           # 静态帧信息密度高，可以更短
+sec_max = 6
+core_sec_min = 2        # 核心镜长 2-3 秒：读画面 + 气泡的时间
+core_sec_max = 3
+core_ratio_min = 0.50
+long_take_sec = 4       # 长镜阈值：≥ 此值必须含台词或画面事件
+reaction_max_sec = 3    # 纯画面情绪格
+
+[motion_comic.single]
+shots_min = 24
+shots_max = 50
+hook_window_s = 2       # 漫剧滑动成本比视频低，开场窗口更紧
+target_duration_s = 120
+duration_tolerance = 0.15
+
+[motion_comic.quality]
+fixed_ratio_min = 0.40     # 推拉摇移是漫剧的常规语言，固定镜不该占多数
+close_medium_ratio_min = 0.70
+dialogue_ratio_min = 0.30  # 漫画以画面叙事，对白镜占比本就低于真人剧
+dialogue_ratio_max = 0.70
+hook_per_seconds = 15
+
+[motion_comic.hook]
+anchor_gap_s = 10       # 漫剧靠切格续节奏，格越短信息点越密，容差最小
+
+[motion_comic.panel]
+grid_min = 4           # 一组最少几格：起承转合
+grid_max = 8
+bubble_line_max = 60   # **气泡对白字数硬上限**——超了气泡装不下，不是风格问题
+sizes = ["大格", "中格", "特写格", "远景格", "插入格"]   # 漫画景别（不用影视景别）
+moves = ["固定", "推", "拉", "摇", "移"]               # 静态帧只可能有这些"运镜"
+# 景别占比按漫画景别算，不用影视"近景/中景"——那是影视景别，写了会抽错提示词
+close_sizes = ["大格", "中格", "特写格"]
+close_ratio_min = 0.60   # 漫画要"读得清"，大格与中格要占多数
+
+[motion_comic.asset]
+char_views = 4         # 角色参考图数量：四视图（正/侧/背/表情）
+ref_per_panel_max = 2  # 单格最多引用几个参考图：超出说明在自由发挥，脸会漂
+scene_bible_required = true   # 场景必须在场景表登记，否则跨镜场景漂移无人发现
+expression_enum = ["平静", "怒", "悲", "惊", "疑", "喜", "冷", "惧"]
+costume_enum_required = true  # 服装必须来自登记表
+consistency_check = ["角色", "场景", "服装", "道具"]   # 这四类跨镜必须可追溯
+
+
+# ------------------------------------------------------------
+# 静态漫 / 条漫（static_comic）：静态格，无运镜
+# ------------------------------------------------------------
+# 与动态漫的唯一区别是**没有运镜**：每格就是一张静止的图，停留够读的时间。
+# 这条差别是硬的——写"推/拉/摇"就是写错了形态，出片时无法执行。
+# 阅读顺序是硬约束：条漫从上到下，页漫从左上到右下。
+[static_comic]
+note = "静态漫/条漫：无运镜，靠停留时长与格序叙事"
+
+[static_comic.shot]
+sec_min = 2             # 停留时长：够读完气泡
+sec_max = 8             # 一个信息密度高的格可以停久一点
+core_sec_min = 2.5
+core_sec_max = 4
+core_ratio_min = 0.55
+long_take_sec = 5
+reaction_max_sec = 4
+
+[static_comic.single]
+shots_min = 20
+shots_max = 44
+hook_window_s = 3
+target_duration_s = 120
+duration_tolerance = 0.15
+
+[static_comic.quality]
+fixed_ratio_min = 1.0      # **必须全部固定**——静态漫有运镜就是形态写错了
+close_medium_ratio_min = 0.60
+dialogue_ratio_min = 0.30
+dialogue_ratio_max = 0.75
+hook_per_seconds = 16
+
+[static_comic.hook]
+anchor_gap_s = 10       # 静态漫无运镜，靠停留时长与格序，格短信息点密
+
+[static_comic.panel]
+grid_min = 4
+grid_max = 8
+bubble_line_max = 60
+sizes = ["大格", "中格", "特写格", "远景格", "插入格"]
+moves = ["固定"]          # 静态漫只可能有固定
+close_sizes = ["大格", "中格", "特写格"]
+close_ratio_min = 0.60
+reading_order = "top_to_bottom"   # 条漫：从上到下
+
+
+# ------------------------------------------------------------
+# 平台规格（画幅 / 时长档 / 安全区）
+# ------------------------------------------------------------
+# 同一部片投不同的平台，规格是不一样的。规格错了，要么被裁掉字幕，
+# 要么时长档不符推荐区间，进不了流量池。
+#
+# 这些都是**可机械核对**的：画幅是比例、时长是秒数、安全区是像素占比。
+[platform.default]
+note = "通用竖屏：没有指定平台时的兜底"
+aspect = "9:16"
+width = 1080
+height = 1920
+duration_band = [30, 180]       # 推荐单集时长区间（秒）
+safe_top_pct = 0.12             # 顶部安全区（占比），字幕/关键信息别放进去
+safe_bottom_pct = 0.18          # 底部安全区：平台 UI 会盖住
+subtitle_safe = true            # 字幕必须落在安全区内
+
+[platform.douyin]
+note = "抖音：竖屏为主，微短剧 1-3 分钟档"
+aspect = "9:16"
+width = 1080
+height = 1920
+duration_band = [60, 180]
+safe_top_pct = 0.13
+safe_bottom_pct = 0.20
+subtitle_safe = true
+
+[platform.hongguo]
+note = "红果短剧：竖屏，免费+广告分账，前 3 集定生死"
+aspect = "9:16"
+width = 1080
+height = 1920
+duration_band = [60, 120]
+safe_top_pct = 0.12
+safe_bottom_pct = 0.20
+subtitle_safe = true
+
+[platform.kuaishou]
+note = "快手：竖屏，社区黏性，1-2 分钟档"
+aspect = "9:16"
+width = 1080
+height = 1920
+duration_band = [45, 150]
+safe_top_pct = 0.12
+safe_bottom_pct = 0.20
+subtitle_safe = true
+
+[platform.youku]
+note = "优酷 / 长视频横屏：16:9，单集更长"
+aspect = "16:9"
+width = 1920
+height = 1080
+duration_band = [300, 900]
+safe_top_pct = 0.05
+safe_bottom_pct = 0.08
+subtitle_safe = true
+
+[platform.bilibili]
+note = "B站：横屏 16:9"
+aspect = "16:9"
+width = 1920
+height = 1080
+duration_band = [60, 600]
+safe_top_pct = 0.06
+safe_bottom_pct = 0.10
+subtitle_safe = true
+
+
+# ------------------------------------------------------------
+# 合规（发布前必过，不是风格建议）
+# ------------------------------------------------------------
+# 国内发布 AI 生成合成内容必须**显式标识**（《人工智能生成合成内容标识办法》）。
+# 这一条是硬要求，且**机械可判**：交付稿里得有标识，且标识字段要真实。
+#
+# 三件事：
+#   1. AIGC 标识必须在交付稿里出现（真人实拍可关）
+#   2. 未成年人题材不拍受害细节（只判是否触碰，具体写法交人）
+#   3. 敏感/违规表达扫描（影射真实单位与当事人、血腥、诱导）
+[compliance]
+aigc_label_required = true        # AI 生成内容必须带标识
+aigc_label_text = "本片由 AI 生成合成"
+aigc_label_in_delivery = true     # 标识必须写进交付稿的基本信息块
+minors_protection = true          # 涉未成年人题材的保护
+minors_terms = ["未成年", "小学", "初中", "幼儿园", "儿童", "男童", "女童"]
+# 敏感表达：命中即警告，由人判断是否误报。
+# ★ 只收**有明确指向的多字短语**。单字（如"表""局""师"）会命中"手表""表达"
+#   "局面"这类日常词，产生大量误报——误报多了人就整个关掉这一项，等于没有。
+sensitive_terms = [
+    "真实姓名", "原型人物", "真人真事", "某某公司", "某某集团",   # 影射真实主体
+    "跳楼", "割腕", "自残", "自杀方法", "轻生",                   # 具体自伤手段
+    "上分", "开黑", "代练",                                       # 平台黑话（易限流）
+]
+# 违规词：命中即阻断（模拟政策红线）
+forbidden_terms = ["代孕", "毒品交易", "枪支买卖", "赌博平台"]
+
+
+# ------------------------------------------------------------
+# 模型能力（生成后端的能力上限）
+# ------------------------------------------------------------
+# **超限必须拒绝，不得截断后调上游。** 模型吐不出来就是吐不出来，
+# 把一个超长的提示词悄悄截短再发，等于让上游的不确定性静默变成下游的错误。
+# 每一档都是**投产前要重新核验**的：模型能力会升级，别把它写成永久事实。
+[model.default]
+note = "通用默认：不确定用哪家时的保守值"
+max_shot_sec = 8            # 单镜最长时长（秒），超了要拆镜
+max_prompt_chars = 1500     # 单镜提示词字数上限，超了要删
+ref_images_max = 3          # 单镜最多参考图张数（>1 张叫多图参考）
+max_retry = 3               # 单镜最多重试次数
+supports_multi_shot = false # 是否支持一镜到底多镜头
+
+[model.seedance]
+note = "Seedance 系：多镜头叙事 + 音频（能力以官方为准，投产前复核）"
+max_shot_sec = 10
+max_prompt_chars = 1500
+ref_images_max = 4
+max_retry = 3
+supports_multi_shot = true
+supports_audio = true
+
+[model.wan]
+note = "通义万相 Wan 系：多镜头 shot_type=multi，支持音频"
+max_shot_sec = 5
+max_prompt_chars = 1200
+ref_images_max = 3
+max_retry = 3
+supports_multi_shot = true
+supports_audio = true
+
+[model.kling]
+note = "可灵 Kling：首尾帧插值成熟"
+max_shot_sec = 10
+max_prompt_chars = 1500
+ref_images_max = 2
+max_retry = 3
+supports_keyframe = true
+
+[model.veo]
+note = "Veo：关键帧驱动（首帧/尾帧）"
+max_shot_sec = 8
+max_prompt_chars = 1500
+ref_images_max = 3
+max_retry = 3
+supports_keyframe = true
+
+
+# ------------------------------------------------------------
+# 付费卡点（系列连载的生死线）
+# ------------------------------------------------------------
+# 单集内部结构决定"这一集好不好看"，卡点决定"观众付不付费"。
+# 四段式管前者，本表管后者。
+#
+# 三条硬规则，全部是确定性可算的：
+#   1. **首付费集的前一集必须是情绪净值最低谷**——先憋到最狠，再给翻盘，
+#      付费转化才起得来。顺序反了（付费前刚好爽完），观众没有付费动机。
+#   2. **付费集结尾必须是钩子**，且卡点评分不低于阈值。
+#   3. 小高潮 / 大高潮按固定 cadence 落位，不能挤在一起也不能断档。
+[cliff]
+cliff_score_min = 85       # 付费集卡点评分下限，低于此值标 high flag
+paywall_valley_required = true   # 规则 1 开关
+climax_min_gap = 5         # 两个高潮之间至少隔几集（防挤堆）
+emotion_release_every = 2  # 每 N 集至少一次情绪释放（防连续憋）
+valence_max = 5            # 情绪净值满分（打分表用的量程）
+
+# 卡点评分的加分项：全部可从分镜表机械判定，无一项需要人读剧本
+[cliff.score]
+line_hook = 10        # 结尾镜台词含钩子词（凭什么/为什么/其实/真相…）
+visual_event = 10     # 结尾镜画面含突发事件（推门/摔倒/耳光/来电…）
+emotion_close = 8     # 结尾镜是情绪特写
+info_reverse = 12     # 结尾镜出现信息反转（身份/关系/真相的揭示）
+cliff_question = 10   # 结尾镜留下未答问题（疑问句收尾）
+call_back = 6         # 结尾镜回收了早期伏笔（台词与前文呼应）
+# 减分项
+flat_ending = 15      # 结尾镜是陈述句收尾，无事发生
+narration_tell = 12   # 靠旁白/字幕交代而非画面
+
+
+# ------------------------------------------------------------
+# 跨集一致性（series 专用）
+# ------------------------------------------------------------
+# 单集好做，连载会崩：到第 20-30 集人设飘、伏笔丢、时间轴对不上。
+# 崩溃的真实形态是**文件与文件互相矛盾**——单看每一集都对，合起来不对。
+# 所以这一组判据查的是"跨集引用完整性"，不是"某一集写得好不好"。
+#
+# 六列表：集 | 角色 | 服装 | 场景 | 道具 | 时间点
+[continuity]
+require_timeline = true        # 必须有连续的时间轴，不许出现空档/重叠
+timeline_gap_max_s = 0        # 相邻集时间轴允许的最大空档（秒），0 = 必须首尾相接
+character_id_required = true   # 角色必须带稳定 ID，跨集引用靠 ID 不靠名字
+scene_reuse_tracked = true     # 复用场景必须台账可追溯
+costume_change_must_declare = true  # 换装必须显式声明是哪一集换的
+foreshadow_double_bind = true  # 伏笔表必须双向一致（埋点↔回收点都对得上）
+dangling_ref_forbidden = true  # 禁止悬空引用（引用了不存在的角色/场景/伏笔 ID）
+
 
 # ------------------------------------------------------------
 # 交付格式（定死的，不要每次重新讨论）
@@ -100,6 +518,8 @@ fixed_ratio_min = 0.65  # 真人运镜偏固定
 [delivery]
 blocks = ["基本信息", "人物表", "场景", "分镜表", "验收额度"]
 shot_columns = ["镜", "时长", "景别", "谁在画面", "动作一句话", "台词原文"]
+# 漫剧/动漫向的交付表列头（格表：多了"格"与"参考图"列）
+comic_columns = ["镜", "时长", "景别", "谁在画面", "画面一句话", "气泡对白"]
 retake_max = 3          # 每镜最多重抽几次
 on_fail = "停"          # 失败是停还是继续：停 | 继续
 # 只发一个定稿 .md。不要 CSV、不要 Word、不要截图、不要英文提示词、

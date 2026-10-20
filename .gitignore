@@ -19,3 +19,9 @@ Thumbs.db
 **/*.wav
 **/*.png
 **/*.jpg
+
+# 对比报告（含对第三方项目的逐项分析，留本地）
+reports/
+
+# 探针临时产物
+_test/tmp/

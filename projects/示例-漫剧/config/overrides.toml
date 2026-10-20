@@ -1,0 +1,9 @@
+# 漫剧形态 · 单集 60 秒
+# ★ 时长与格数必须自洽：漫剧核心镜长 2-3 秒，60 秒 ÷ 2.5s ≈ 24 格。
+#   写 120 秒就要 40-60 格；若只给 24 格，每格 5 秒，超出核心镜长区间。
+form = "motion_comic"
+[single]
+target_duration_s = 60
+duration_tolerance = 0.15
+shots_min = 20
+shots_max = 30

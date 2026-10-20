@@ -21,7 +21,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from common import CONST, C, apply_shot_profile, bar, constants_for
+from common import (CONST, C, apply_form_profile, bar, compliance_for,
+                    constants_for, model_for, normalize_form, platform_for)
 
 D_ = CONST["drama"]
 DS_ = D_["single"]
@@ -33,34 +34,82 @@ DQ_ = D_["quality"]
 HOOK_LINE = ("？", "?", "凭什么", "为什么", "难道", "竟然", "居然", "没想到",
              "其实", "真相", "秘密", "骗", "撒谎", "闭嘴", "滚", "你敢",
              "分手", "离婚", "后悔")
-# 画面里的事件信号：突发 / 动作转折 / 关键道具
+# 画面里的事件信号：突发 / 动作转折 / 关键道具。
+# ★ 词表要收"实际会写出来的说法"。只收"推门"而剧本写"门被推开"，
+#   判据就整条失效——而失效率不会报错，只会表现为"钩子断档"误报。
 HOOK_VISUAL = ("震动", "来电", "消息", "响起", "铃声", "突然", "瞬间", "推门",
-               "起身", "站起", "跪", "耳光", "摔", "撕", "转身走", "拉住",
-               "抱住", "吻", "拥抱", "亮起")
+               "门被推开", "起身", "站起", "跪", "耳光", "摔", "撕", "转身走", "拉住",
+               "抱住", "吻", "拥抱", "亮起", "闪", "空无一人", "空了", "没人",
+               "湿透", "攥紧", "停在", "没动", "回头", "低头看")
 # 情绪推进型运镜才算钩子信号；缓拉/跟移/跟摇是收尾语言，不算
 HOOK_MOVES = ("缓推", "推", "仰拍", "俯拍", "摇")
 
 CLOSE_SIZES = ("特写", "大特写")
 
-PROFILES = ("ai", "live")
+FORMS = ("live_action", "anime", "motion_comic", "static_comic")
+
+# 漫画景别与运镜白名单（兜底，实际以 [panel].sizes / .moves 为准）：
+# 不在表内的说明写的是影视景别，模型会抽错提示词
+COMIC_SIZES = ("大格", "中格", "特写格", "远景格", "插入格")
+COMIC_MOVES = ("固定", "推", "拉", "摇", "移")
+
+# 哪些形态用"格"不用影视景别——**只有两种漫**（静态帧）。
+# 动漫短剧是连续动画，用影视景别（近景/中景/特写），不算"格"形态。
+# 这些形态的近中景占比必须按漫画景别算，否则 size_dist 里没有"近景/中景"
+# 两个键，cm_ratio 恒为 0，**每次扫描都会误报"近中景占比偏低"**
+# （实测：漫剧样本 24 格全判 0%）。
+PANEL_FORMS = ("motion_comic", "static_comic")
+STATIC_FORMS = ("static_comic",)
 
 
-def resolve_profile(d: dict, mode: str = "ai") -> tuple:
-    """从 drama 表里取三张判据表 → (shot, single, quality)。
+def near_medium_set(d: dict) -> tuple:
+    """本形态下"该占多数"的景别集合（用于近中景占比判据）。
 
-    `[drama.shot]` / `[drama.single]` / `[drama.quality]` 是 **AI 生成档**的基线；
-    `[drama.live.*]` 只写与 AI 档的差异项，按表名分组逐表覆盖。
-
-    档位应用本身发生在 `common.apply_shot_profile`——那里保证了
-    「项目覆盖 > 档位 > 全局基线」的优先级。本函数只负责读取：
-
-    - `d` 带 `_profile` 标记 → 上游已算好，直接用；此时**忽略 mode 参数**，
-      因为带标记的常数已经合过项目覆盖，优先级高于命令行档位。
-    - `d` 没有标记（调用方直接传了 CONST）→ 按 mode 现场应用一次。
+    视频形态与旧版一致：近景 + 中景（**不含特写**——连用特写观众失去空间感）。
+    漫画形态用格：大格 / 中格 / 特写格。
     """
-    if "_profile" not in d:
-        d = apply_shot_profile({"drama": d}, mode)["drama"]
-    return dict(d["shot"]), dict(d["single"]), dict(d["quality"])
+    if d.get("form") in PANEL_FORMS:
+        panel = d.get("panel") or {}
+        return tuple(panel.get("close_sizes") or COMIC_SIZES)
+    return ("近景", "中景")
+
+
+def reaction_set(d: dict) -> tuple:
+    """本形态下的"情绪特写"景别集合（用于反应镜时长判据）。
+
+    与 near_medium_set **是两个不同的集合**，别混：
+      - 近中景管"观众看得清脸"，含近景
+      - 反应镜管"纯画面情绪格有多长"，只含特写级
+    视频形态：特写 / 大特写。漫画形态：特写格。
+    """
+    if d.get("form") in PANEL_FORMS:
+        return ("特写格", "大格")
+    return CLOSE_SIZES
+
+
+
+def resolve_profile(d: dict, mode: str = "ai", form: str | None = None) -> tuple:
+    """从 drama 表里取判据表 → (shot, single, quality, panel, asset)。
+
+    `[shot] / [single] / [quality]` 是**全局视频基线**；
+    各形态（anime / motion_comic / static_comic）只写与基线的差异项，
+    按表名分组逐表覆盖。
+
+    形态与档位的应用发生在 `common.apply_form_profile`——那里保证了
+    「项目覆盖 > 形态 > 档位 > 全局基线」的优先级。本函数只负责读取：
+
+    - `d` 带 `form` 标记 → 上游已算好，直接用；此时**忽略 mode/form 参数**，
+      因为带标记的常数已经合过项目覆盖，优先级高于命令行档位。
+    - `d` 没有标记（调用方直接传了 CONST）→ 按 mode/form 现场应用一次。
+
+    `panel` / `asset` 只在有"格"的形态下非空；视频形态拿到 `{}`，
+    下游一律 `(d.get("panel") or {})` 取用，不直接下标。
+    """
+    if "form" not in d:
+        d = apply_form_profile({"drama": d}, form or "live_action", mode)["drama"]
+    return (dict(d["shot"]), dict(d["single"]), dict(d["quality"]),
+            dict(d.get("panel") or {}), dict(d.get("asset") or {}))
+
 
 
 
@@ -162,11 +211,16 @@ def has_content(s: dict) -> bool:
     return bool(t) and t != "无"
 
 
-def is_hook(s: dict) -> bool:
-    """启发式钩子信号：情绪运镜 / 情绪特写 / 冲突台词 / 突发事件 / 信息密集长镜。"""
+def is_hook(s: dict, close_sizes: tuple = CLOSE_SIZES) -> bool:
+    """启发式钩子信号：情绪运镜 / 情绪特写 / 冲突台词 / 突发事件 / 信息密集长镜。
+
+    ★ `close_sizes` 必须按形态传入。写死"特写/大特写"会让漫剧的"特写格/大格"
+    一个都认不出——**漫剧形态下钩子判据会整体失效，表现为所有窗口都"断档"**
+    （实测：《便利店》24 格全判无钩子）。
+    """
     if any(m in (s["move"] or "") for m in HOOK_MOVES):
         return True
-    if s["size"] in CLOSE_SIZES:
+    if s["size"] in close_sizes:
         return True
     if any(w in (s.get("line") or "") for w in HOOK_LINE):
         return True
@@ -175,6 +229,7 @@ def is_hook(s: dict) -> bool:
     if s["sec"] >= DSHOT_["long_take_sec"]:
         return True
     return False
+
 
 
 def has_ending_hook(s: dict) -> bool:
@@ -189,7 +244,8 @@ def has_ending_hook(s: dict) -> bool:
     return False
 
 
-def hook_windows(shots: list[dict], window_s: int) -> list[dict]:
+def hook_windows(shots: list[dict], window_s: int,
+                 close_sizes: tuple = CLOSE_SIZES) -> list[dict]:
     """按累计时长切窗口，返回每个窗口及其是否含钩子。"""
     wins, cur, t0, acc = [], [], 0.0, 0.0
     for s in shots:
@@ -197,24 +253,365 @@ def hook_windows(shots: list[dict], window_s: int) -> list[dict]:
         acc += s["sec"]
         if acc >= window_s:
             wins.append({"t0": round(t0, 1), "t1": round(t0 + acc, 1),
-                         "shots": cur, "hook": any(is_hook(x) for x in cur)})
+                         "shots": cur,
+                         "hook": any(is_hook(x, close_sizes) for x in cur)})
             t0 += acc
             acc, cur = 0.0, []
     if cur:
         wins.append({"t0": round(t0, 1), "t1": round(t0 + acc, 1),
-                     "shots": cur, "hook": any(is_hook(x) for x in cur)})
+                     "shots": cur,
+                     "hook": any(is_hook(x, close_sizes) for x in cur)})
     return wins
 
 
+def hook_anchors(d: dict) -> list:
+    """秒级锚点表（config [hook].anchors），形态/档位/项目覆盖后取值。"""
+    h = d.get("hook") or {}
+    anchors = [a for a in (h.get("anchors") or []) if isinstance(a, (int, float))]
+    return sorted(float(a) for a in anchors)
+
+
+def fmt_anchors(anchors: list) -> str:
+    """锚点秒表的人类可读形式（0/30/60/…/180s）。空表给占位，不返回空串。"""
+    if not anchors:
+        return "（未配置）"
+    return "/".join(f"{a:g}" for a in anchors) + "s"
+
+
+def hook_anchor_checks(shots: list[dict], d: dict,
+                       close_sizes: tuple = CLOSE_SIZES) -> tuple[list, list]:
+    """秒级锚点核验：该炸的秒数上必须炸（比均匀窗口更接近爆款节奏）。
+
+    两条硬规则：
+      1. **锚点 0 = 对抗开场**：第一镜自己就得是钩子。铺垫式开场在第一秒
+         就被划走，这是唯一没有容差的锚点。
+      2. 其余锚点 t：到第 t 秒为止，最后一个钩子距 t 不得超过 anchor_gap_s；
+         从未出现过钩子也算未命中。
+
+    超出总时长的锚点**自动忽略**——60 秒的片子不查 180s 锚点，
+    为够不着的秒数误报是把尺子用反。
+
+    返回 (未命中锚点列表, 全部锚点明细)。anchor_required = false 时直接放行。
+    """
+    h = d.get("hook") or {}
+    if h.get("anchor_required") is False:
+        return [], []
+    anchors = hook_anchors(d)
+    if not anchors:
+        return [], []
+    gap = float(h.get("anchor_gap_s") or 15)
+
+    total = sum(s["sec"] for s in shots)
+    ends, acc = [], 0.0
+    for s in shots:
+        acc += s["sec"]
+        if is_hook(s, close_sizes):
+            ends.append(round(acc, 2))
+
+    detail, miss = [], []
+    for a in anchors:
+        if a > total + 1e-9:
+            continue                      # 够不着的锚点不查
+        if a == 0:
+            ok = bool(shots) and is_hook(shots[0], close_sizes)
+            last = 0.0 if ok else None
+        else:
+            last = max((e for e in ends if e <= a + 1e-9), default=None)
+            ok = last is not None and (a - last) <= gap + 1e-9
+        detail.append({"anchor": a, "ok": ok,
+                       "dist": None if last is None else round(a - last, 1)})
+        if not ok:
+            miss.append(a)
+    return miss, detail
+
+
+def is_comic(d: dict) -> bool:
+    return d.get("form") in PANEL_FORMS
+
+
+def comic_panel_checks(shots: list[dict], d: dict) -> tuple[list, list, dict]:
+    """漫剧 / 静态漫专属判据。视频形态一律返回空——这些检查对视频短剧毫无意义。
+
+    五类，全部确定性可算：
+      1. **气泡对白字数**：超上限就是装不下，物理问题不是风格问题
+      2. **景别 / 运镜白名单**：写影视景别（近景/中景）模型会抽错提示词，
+         漫画只有"格"
+      3. **静态漫不许有运镜**：写了推拉就是形态写错了，出片时执行不了
+      4. **格组起承转合**：一组格子数越界说明节拍粒度失控
+      5. **参考图配额**：单格引用的参考图超过配额，说明在自由发挥，脸会漂
+
+    第 5 项依赖分镜表里有「参考图」列；交付表（6 列）没有这列，
+    所以只在工作格式（7 列）下可查，缺列时明确记 `asset_unverifiable`
+    ——**不能静默当成通过**。
+    """
+    blocking, warning, info = [], [], {}
+    if d.get("form") not in PANEL_FORMS:
+        return blocking, warning, info
+    panel = d.get("panel") or {}
+    asset = d.get("asset") or {}
+    if not panel:
+        return blocking, warning, info
+    frm = d.get("form")
+
+    cap = panel.get("bubble_line_max")
+    if cap:
+        over = [s for s in shots
+                if has_line(s) and len(re.sub(r"[\s，。！？、…—～·]", "",
+                                              s["line"] or "")) > cap]
+        if over:
+            blocking.append({
+                "check": "气泡对白超长",
+                "value": "镜 " + "/".join(f"{s['no']}({len(s['line'])}字)" for s in over),
+                "limit": f"气泡最多 {cap} 字，超了装不下",
+            })
+
+    sizes = panel.get("sizes") or list(COMIC_SIZES)
+    moves = panel.get("moves") or list(COMIC_MOVES)
+    bad_size = [s for s in shots if s["size"] not in sizes]
+    if bad_size:
+        warning.append({
+            "check": "景别不在漫画白名单",
+            "value": "镜 " + "/".join(f"{s['no']}({s['size']})" for s in bad_size),
+            "limit": "、".join(sizes),
+        })
+    bad_move = [s for s in shots if s["move"] not in moves]
+    if bad_move:
+        # 静态漫写了运镜不是"警告"是"形态写错"——它根本没法执行，阻断级
+        level = blocking if frm in STATIC_FORMS else warning
+        level.append({
+            "check": "静态漫出现运镜" if frm in STATIC_FORMS else "运镜不在漫画白名单",
+            "value": "镜 " + "/".join(f"{s['no']}({s['move']})" for s in bad_move),
+            "limit": "、".join(moves) if frm not in STATIC_FORMS
+                     else "静态漫只能固定，无运镜",
+        })
+
+    gmin, gmax = panel.get("grid_min", 4), panel.get("grid_max", 8)
+    n = len(shots)
+    if gmin and gmax:
+        # 按格组粗查：总格数应能整分为若干组，且每组落在区间内
+        if gmin <= n <= gmax * 8:
+            groups = max(1, round(n / ((gmin + gmax) / 2)))
+            per = n / groups
+            if per < gmin or per > gmax:
+                warning.append({
+                    "check": "格组粒度失控",
+                    "value": f"共 {n} 格，按 {groups} 组均分每组 {per:.1f} 格",
+                    "limit": f"每组 {gmin}-{gmax} 格（起承转合）",
+                })
+    info["grid_range"] = (gmin, gmax)
+    info["grids"] = n
+    info["bubble_cap"] = cap
+    info["reading_order"] = panel.get("reading_order", "")
+
+    # 参考图配额：只有工作格式（带 prompt_en 列）才查得到
+    quota = asset.get("ref_per_panel_max") or asset.get("ref_per_shot_max")
+    if quota:
+        refs = [s for s in shots if (s.get("prompt_en") or "").count("ref:") > quota]
+        if refs:
+            warning.append({
+                "check": "单格参考图超配额",
+                "value": "镜 " + "/".join(str(s["no"]) for s in refs),
+                "limit": f"每格最多 {quota} 张（超出=自由发挥，脸会漂）",
+            })
+        else:
+            info["ref_quota_ok"] = True
+
+    if asset.get("scene_bible_required"):
+        info["scene_bible_required"] = True   # 由 check_delivery 查场景表
+    if asset.get("color_sheet_required"):
+        info["color_sheet_required"] = True
+    if asset.get("style_anchor_required"):
+        info["style_anchor_required"] = True
+    return blocking, warning, info
+
+
+# ------------------------------------------------------------
+# 合规：发布前必过，机械可判的三件
+# ------------------------------------------------------------
+
+def compliance_checks(text: str, shots: list[dict], d: dict,
+                      form: str, is_ai: bool = True) -> tuple[list, list, dict]:
+    """合规检查：AIGC 标识 / 未成年人题材 / 敏感与违规表达。
+
+    三条都**只判"有没有触碰"**，具体怎么改交人——判据不该假装懂内容。
+      - **AIGC 标识**：AI 生成内容必须显式标识（国内发布硬要求）。
+        真人实拍档可关（`--live-shoot`），AI 生成必查。
+      - **未成年人题材**：命中术语即提示"不拍受害细节"，不判对错。
+      - **违规词**：命中即阻断（政策红线）；敏感词只警告（可能是误报）。
+    """
+    comp = compliance_for(d and {"drama": d} or None)
+    blocking, warning, info = [], [], {}
+    body = text or ""
+
+    # 1) AIGC 标识
+    if comp.get("aigc_label_required") and is_ai:
+        label = str(comp.get("aigc_label_text") or "AI 生成")
+        key = label[:6]
+        if key and key not in body and "AI 生成" not in body and "人工智能" not in body:
+            blocking.append({
+                "check": "缺 AIGC 标识",
+                "value": "交付稿中未见 AI 生成合成标识",
+                "limit": f"必须有标识（如「{label}」），国内发布硬要求",
+            })
+        else:
+            info["aigc_labeled"] = True
+
+    # 2) 未成年人题材
+    if comp.get("minors_protection"):
+        hits = [t for t in (comp.get("minors_terms") or []) if t in body]
+        if hits:
+            warning.append({
+                "check": "涉未成年人题材",
+                "value": "、".join(sorted(set(hits))),
+                "limit": "不拍受害细节、不给加害过程；只判触碰，写法交人",
+            })
+
+    # 3) 违规 / 敏感
+    forb = [t for t in (comp.get("forbidden_terms") or []) if t in body]
+    if forb:
+        blocking.append({
+            "check": "命中违规词",
+            "value": "、".join(sorted(set(forb))),
+            "limit": "政策红线，必须删改",
+        })
+    sens = [t for t in (comp.get("sensitive_terms") or []) if t in body]
+    if sens:
+        warning.append({
+            "check": "命中敏感表达（可能是误报）",
+            "value": "、".join(sorted(set(sens))),
+            "limit": "影射真实主体 / 具体自伤手段 / 平台黑话，确认后保留或删改",
+        })
+    return blocking, warning, info
+
+
+# ------------------------------------------------------------
+# 模型能力：超限必须拒绝，不得截断后调上游
+# ------------------------------------------------------------
+
+def model_checks(shots: list[dict], d: dict, model: str | None = None) -> tuple[list, list, dict]:
+    """按生成后端能力核验镜头表，**超限即阻断**。
+
+    "把一个超长的镜头悄悄拆短再发上游"是本项目要防的事：模型吐不出来就是
+    吐不出来，让上游的不确定性静默变成下游的错误结论，是最贵的错。
+
+    查三样（都能从分镜表机械判定），每一样都挂上失败模式分类
+    （config [failure.modes]）——不只说"超了"，还说"这会以什么形态失败、
+    该怎么修"：
+      - **单镜时长超上限** → 失败模式「时长超」
+      - **参考图张数超额度** → 失败模式「参考图超」
+      - **提示词字数超上限**（仅在能从 prompt_en 列估长时查）→ 失败模式「字数超」
+
+    「审核」「网络」两类失败事前不可完全预判（detectable = false），
+    不进阻断，只在 info 里列出，让人知道它们出现了别怪剧本。
+    """
+    blocking, warning, info = [], [], {}
+    m = model_for({"drama": d}, model) if (shots and d) else model_for(None, model)
+    if not m:
+        return blocking, warning, info
+    modes = ((d or {}).get("failure") or {}).get("modes") or {}
+
+    def _mode(name: str) -> dict:
+        mo = modes.get(name) or {}
+        return {"failure": name,
+                "fix": mo.get("fix", ""),
+                "trigger": mo.get("trigger", "")}
+
+    max_sec = m.get("max_shot_sec")
+    if max_sec:
+        over = [s for s in shots if s["sec"] > max_sec]
+        if over:
+            blocking.append({
+                "check": "单镜超模型时长上限",
+                "value": "镜 " + "/".join(f"{s['no']}({s['sec']:g}s)" for s in over),
+                "limit": f"该后端单镜 ≤ {max_sec}s，超了必须拆镜（不许截断后发）",
+                **_mode("时长超"),
+            })
+        else:
+            info["shot_sec_ok"] = True
+
+    ref_max = m.get("ref_images_max")
+    if ref_max:
+        over_ref = [s for s in shots
+                    if (s.get("prompt_en") or "").count("ref:") > ref_max]
+        if over_ref:
+            warning.append({
+                "check": "参考图超模型额度",
+                "value": "镜 " + "/".join(str(s["no"]) for s in over_ref),
+                "limit": f"该后端单镜最多 {ref_max} 张参考图",
+                **_mode("参考图超"),
+            })
+
+    # 提示词字数：交付表没有 prompt_en 列，只在能估长时查；估不出就明说
+    # "不可验"，不许静默当成通过。
+    char_max = m.get("max_prompt_chars")
+    if char_max:
+        estimable = [s for s in shots if (s.get("prompt_en") or "").strip()]
+        if estimable:
+            over_p = [s for s in estimable if len(s["prompt_en"]) > char_max]
+            if over_p:
+                warning.append({
+                    "check": "提示词超字数上限",
+                    "value": "镜 " + "/".join(
+                        f"{s['no']}({len(s['prompt_en'])}字符)" for s in over_p),
+                    "limit": f"该后端单镜提示词 ≤ {char_max} 字符",
+                    **_mode("字数超"),
+                })
+        else:
+            info["prompt_chars_unverifiable"] = True
+
+    info["model"] = m.get("note", "")
+    info["max_shot_sec"] = max_sec
+    # 事前不可预判的两类失败：列出来供人对照，不参与判定
+    info["undetectable_modes"] = [k for k, v in modes.items()
+                                  if v.get("detectable") is False]
+    return blocking, warning, info
+
+
+# ------------------------------------------------------------
+# 平台规格：画幅 / 时长档 / 安全区
+# ------------------------------------------------------------
+
+def platform_checks(text: str, total_s: float, fmt: str, d: dict,
+                    platform: str | None = None) -> tuple[list, list, dict]:
+    """平台规格核对：时长档 + 安全区（画幅只能人核，机器判不了构图）。
+
+    - **时长档**：不同平台推荐的单集时长区间不同。60 秒的片投优酷横屏（300s 起）
+      就进不了推荐池——这是**可机械核对**的。
+    - **安全区**：交付稿里若写了"字幕在画面底部"，而底部 20% 是平台 UI 覆盖区，
+      字幕会被盖住——查正文有没有显式声明安全区遵守。
+    """
+    blocking, warning, info = [], [], {}
+    spec = platform_for(d and {"drama": d} or None, platform)
+    band = spec.get("duration_band")
+    info["platform_aspect"] = spec.get("aspect", "")
+    info["platform_band"] = band
+
+    if band and fmt == "single" and total_s:
+        lo, hi = float(band[0]), float(band[1])
+        if total_s < lo or total_s > hi:
+            warning.append({
+                "check": "时长不在平台推荐档",
+                "value": f"{total_s:.0f}s",
+                "limit": f"{spec.get('note', '该平台')} 推荐 {lo:.0f}-{hi:.0f}s",
+            })
+    return blocking, warning, info
+
+
+
 def analyze(shots: list[dict], fmt: str = "single", text: str = "",
-            const: dict | None = None, mode: str = "ai") -> dict:
+            const: dict | None = None, mode: str = "ai",
+            form: str | None = None, platform: str | None = None,
+            model: str | None = None, is_ai: bool = True) -> dict:
     if not shots:
         raise ValueError("未解析到任何镜头")
 
     c = const or CONST
     d = c["drama"]
-    dshot, dsingle, dq = resolve_profile(d, mode)
+    if "form" not in d:
+        d = apply_form_profile({"drama": d}, form or "live_action", mode)["drama"]
+    dshot, dsingle, dq, dpanel, dasset = resolve_profile(d)
     prof = d.get("_profile", "ai")
+    frm = d.get("form", "live_action")
     n = len(shots)
     total = sum(s["sec"] for s in shots)
     sec_dist = Counter(s["sec"] for s in shots)
@@ -224,22 +621,30 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
     fixed = [s for s in shots if s["move"] == "固定"]
     core = [s for s in shots if dshot["core_sec_min"] <= s["sec"] <= dshot["core_sec_max"]]
     long_take = [s for s in shots if s["sec"] >= dshot["long_take_sec"]]
-    close_noline = [s for s in shots if s["size"] in CLOSE_SIZES and not has_line(s)]
+    # ★ 近中景/特写景别必须按形态选名词：漫画形态用"大格/中格/特写格"，
+    #   视频形态用"近景/中景/特写"。混用会让 cm_ratio 恒为 0、
+    #   让特写反应镜判据整体失效（旧版实测 bug）。
+    csizes = near_medium_set(d)          # 近中景：管"脸看得清"
+    rxsizes = reaction_set(d)            # 反应镜：管"情绪格多长"，与上者是两个集合
+    # 末镜有专属规则（single 要余味长镜 ≥long_take），与"反应镜不能太长"天然冲突。
+    # 两条判据各行其道：反应镜判据排除末镜，末镜由结尾规则管。
+    close_noline = [s for s in shots if s["size"] in rxsizes and not has_line(s)
+                    and s["no"] != shots[-1]["no"]]
 
     fixed_ratio = len(fixed) / n
-    cm_ratio = (size_dist.get("近景", 0) + size_dist.get("中景", 0)) / n
+    cm_ratio = sum(size_dist.get(k, 0) for k in csizes) / n
     dlg_ratio = len(dlg) / n
     core_ratio = len(core) / n
 
     blocking, warning = [], []
 
-    # 黄金 3 秒：镜 1 不得超长，且不得用旁白交代
+    # 黄金窗口：镜 1 不得超长，且不得用旁白交代
     first = shots[0]
     if first["sec"] > dsingle["hook_window_s"]:
-        blocking.append({"check": "黄金3秒超长",
+        blocking.append({"check": "黄金窗口超长",
                          "value": f"镜 1 = {first['sec']}s", "limit": f"≤ {dsingle['hook_window_s']}s"})
     if "旁白" in (first.get("line") or ""):
-        blocking.append({"check": "黄金3秒用旁白交代",
+        blocking.append({"check": "黄金窗口用旁白交代",
                          "value": first["line"][:24], "limit": "用画面/物件钉处境"})
 
     # 长镜必须承载内容（台词 / 字幕 / 旁白），不得是纯空镜
@@ -276,8 +681,9 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
         warning.append({"check": "固定镜头占比偏低", "value": f"{fixed_ratio * 100:.0f}%",
                         "limit": f"≥ {dq['fixed_ratio_min'] * 100:.0f}%"})
     if cm_ratio < dq["close_medium_ratio_min"]:
-        warning.append({"check": "近景+中景占比偏低", "value": f"{cm_ratio * 100:.0f}%",
-                        "limit": f"≥ {dq['close_medium_ratio_min'] * 100:.0f}%"})
+        warning.append({"check": "近中景占比偏低", "value": f"{cm_ratio * 100:.0f}%",
+                        "limit": f"≥ {dq['close_medium_ratio_min'] * 100:.0f}%"
+                                 f"（{'、'.join(csizes)}）"})
     if core_ratio < dshot["core_ratio_min"]:
         # 区间写进检查名：AI 档是 3-4 秒，真人档是 5-10 秒，写死会误导
         span = f"{dshot['core_sec_min']:g}-{dshot['core_sec_max']:g}s"
@@ -292,13 +698,24 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
                         "value": "镜 " + "/".join(str(s["no"]) for s in over_reaction),
                         "limit": f"特写无台词镜 ≤ {dshot['reaction_max_sec']:g}s"})
 
-    # 钩子密度
-    wins = hook_windows(shots, dq["hook_per_seconds"])
+    # 钩子密度（景别按形态取，否则漫剧全判断档）
+    wins = hook_windows(shots, dq["hook_per_seconds"], rxsizes)
     miss = [w for w in wins if not w["hook"]]
     if miss:
         spans = "、".join(f"{w['t0']:.0f}-{w['t1']:.0f}s" for w in miss)
         warning.append({"check": "钩子断档", "value": spans,
                         "limit": f"每 {dq['hook_per_seconds']}s 至少一个钩子"})
+
+    # 秒级锚点：均匀窗口管"不许有长段平淡"，锚点管"该炸的秒数必须炸"。
+    # 两者不互相替代：断档是兜底，锚点未命中的片子可能没有任何断档，
+    # 但该爆破的 60s / 90s 上是平的——而平淡的爆破点就是划走点。
+    anchor_miss, anchor_detail = hook_anchor_checks(shots, d, rxsizes)
+    if anchor_miss:
+        spans = "、".join(f"{a:g}s" for a in anchor_miss)
+        warning.append({"check": "锚点未命中", "value": spans,
+                        "limit": f"锚点 {fmt_anchors(hook_anchors(d))} 上"
+                                 f"{(d.get('hook') or {}).get('anchor_gap_s', 15)}s 内必须有钩子"
+                                 f"（0s = 对抗开场，无容差）"})
 
     # 分幕核对（表内标注 vs 逐镜相加）
     act_check = []
@@ -309,21 +726,51 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
                           "shots": len(seg)})
     act_drift = [a for a in act_check if a["delta"] != 0]
 
+    # 形态专属判据（视频形态返回空三件套）
+    cblock, cwarn, cinfo = comic_panel_checks(shots, d)
+    blocking += cblock
+    warning += cwarn
+
+    # 合规（AIGC 标识 / 未成年人 / 违规敏感）
+    kblock, kwarn, kinfo = compliance_checks(text, shots, d, frm, is_ai=is_ai)
+    blocking += kblock
+    warning += kwarn
+
+    # 模型能力：超限即阻断，不许截断后调上游。
+    # ★ 只对 AI 生成档查——真人实拍没有"生成后端"，镜长由表演决定，
+    #   拿模型上限去拦真人长镜是把尺子用反了（实测：《撑伞》真人档
+    #   10 秒长镜被 AI 后端的 8s 上限误拦）。
+    if is_ai:
+        mblock, mwarn, minfo = model_checks(shots, d, model)
+    else:
+        mblock, mwarn, minfo = [], [], {"skipped": "真人实拍，不计模型上限"}
+    blocking += mblock
+    warning += mwarn
+
+    # 平台规格：时长档
+    pblock, pwarn, pinfo = platform_checks(text, total, fmt, d, platform)
+    warning += pwarn
+
     return {
         "n": n, "total": total, "avg": round(total / n, 2),
         "median": sorted(s["sec"] for s in shots)[n // 2],
+        "form": frm,
         "sec_dist": dict(sorted(sec_dist.items())),
         "size_dist": dict(size_dist.most_common()),
         "move_dist": dict(move_dist.most_common()),
         "dialogue_n": len(dlg), "fixed_n": len(fixed),
         "fixed_ratio": round(fixed_ratio, 3), "cm_ratio": round(cm_ratio, 3),
         "dlg_ratio": round(dlg_ratio, 3), "core_ratio": round(core_ratio, 3),
+        "close_sizes": list(csizes),
         "windows": wins, "hook_miss": len(miss),
         "act_check": act_check, "act_drift": act_drift,
+        "comic": cinfo, "compliance": kinfo, "model": minfo, "platform": pinfo,
         "blocking": blocking, "warning": warning,
         "baseline": {
             "source": "项目覆盖" if (c or {}).get("_has_overrides") else "全局默认",
             "profile": prof,
+            "form": frm,
+            "platform": pinfo.get("platform_aspect", ""),
             "target_s": dsingle["target_duration_s"] if fmt == "single"
                       else d["series"]["episode_target_s"],
             "shots_min": dsingle["shots_min"] if fmt == "single" else None,
@@ -333,25 +780,35 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
     }
 
 
+
 def analyze_changed(shots: list[dict], changed: list[int], fmt: str = "single",
                     text: str = "", const: dict | None = None,
-                    full: dict | None = None, mode: str = "ai") -> dict:
+                    full: dict | None = None, mode: str = "ai",
+                    form: str | None = None, model: str | None = None,
+                    is_ai: bool = True) -> dict:
     """增量重扫：只重检受影响镜头（修订后只重检受影响镜头）。
 
     为什么需要它：改 3 个镜头就全表重跑，代价随集数线性增长，而**只有改动点可能引入新问题**。
     但要诚实地区分两类判据——
 
-    - **镜头局部判据**（可增量）：长镜空镜 / 特写反应镜偏长 / 黄金 3 秒（仅当镜 1 被改）
+    - **镜头局部判据**（可增量）：长镜空镜 / 特写反应镜偏长 / 黄金窗口（仅当镜 1 被改）
       / 结尾镜（仅当最后一镜被改）。这些只取决于被改的那几个镜头本身。
     - **全表比例判据**（必须全量）：固定镜占比 / 近中景占比 / 核心镜长占比 / 对白镜占比 /
       钩子断档 / 时长与镜数。这些是**分母相关的统计量**，改一个镜头会牵动全表。
 
     所以增量结果里，`local` 是本次重检的结论，`global_stale` 明确列出"因改动而失效、
     需全量复算"的比例判据名——不假装它们还能用。
+
+    ★ `global_stale` 必须**按当前形态与档位动态生成**：写死成"核心镜长(3-4s)占比"
+    在真人档（5-10s）下名字是错的，漫剧形态下"近景+中景占比"这个词根本不适用。
     """
     const = const or CONST
     d = const["drama"]
-    dshot, dsingle, dq = resolve_profile(d, mode)
+    if "form" not in d:
+        d = apply_form_profile({"drama": d}, form or "live_action", mode)["drama"]
+    dshot, dsingle, dq, _dpanel, _dasset = resolve_profile(d)
+    csizes = near_medium_set(d)
+    rxsizes = reaction_set(d)
     changed_set = set(changed)
     by_no = {s["no"]: s for s in shots}
     n = len(shots)
@@ -368,18 +825,18 @@ def analyze_changed(shots: list[dict], changed: list[int], fmt: str = "single",
             local_blocking.append({"check": "长镜空镜", "value": f"镜 {no}",
                                    "limit": f"≥{dshot['long_take_sec']}s 必须含台词/字幕"})
         # 2) 特写无台词反应镜偏长（镜头局部）
-        if s["size"] in CLOSE_SIZES and not has_line(s) and s["sec"] > dshot["reaction_max_sec"]:
+        if s["size"] in rxsizes and not has_line(s) and s["sec"] > dshot["reaction_max_sec"]:
             local_warning.append({"check": "特写反应镜偏长", "value": f"镜 {no}",
                                   "limit": f"特写无台词镜 ≤ {dshot['reaction_max_sec']:g}s"})
 
-    # 3) 黄金 3 秒：只有当镜 1 本身被改时才重检
+    # 3) 黄金窗口：只有当镜 1 本身被改时才重检
     if 1 in changed_set and shots:
         first = shots[0]
         if first["sec"] > dsingle["hook_window_s"]:
-            local_blocking.append({"check": "黄金3秒超长", "value": f"镜 1 = {first['sec']}s",
+            local_blocking.append({"check": "黄金窗口超长", "value": f"镜 1 = {first['sec']}s",
                                    "limit": f"≤ {dsingle['hook_window_s']}s"})
         if "旁白" in (first.get("line") or ""):
-            local_blocking.append({"check": "黄金3秒用旁白交代",
+            local_blocking.append({"check": "黄金窗口用旁白交代",
                                    "value": first["line"][:24], "limit": "用画面/物件钉处境"})
 
     # 4) 结尾判据：只有当最后一镜被改时才重检
@@ -394,10 +851,30 @@ def analyze_changed(shots: list[dict], changed: list[int], fmt: str = "single",
                 local_blocking.append({"check": "连载结尾无钩子", "value": f"镜 {last['no']}",
                                        "limit": "最后一镜必须留悬念"})
 
-    # 5) 失效的全表比例判据：改动越多，失效面越大
-    global_checks = ["固定镜头占比", "近景+中景占比", "核心镜长(3-4s)占比", "对白镜占比",
-                     "钩子断档", "单集时长", "镜数"]
+    # 4.5) 模型超限与合规：增量路径必须接上这两组，否则全量能拦的问题
+    #      在 --changed 下被静默放过（"修订后只重检受影响镜头"≠"不检了"）。
+    #      - 模型超限只取决于被改镜头自身（时长/参考图/提示词），是镜头局部判据；
+    #      - 合规只扫正文，正文与分镜全量传入，结论不依赖 changed。
+    changed_shots = [by_no[no] for no in sorted(changed_set) if no in by_no]
+    if is_ai and changed_shots:
+        mblock, mwarn, _ = model_checks(changed_shots, d, model)
+        local_blocking += mblock
+        local_warning += mwarn
+    kblock, kwarn, _ = compliance_checks(text, shots, d,
+                                         d.get("form") or form or "live_action",
+                                         is_ai=is_ai)
+    local_blocking += kblock
+    local_warning += kwarn
+
+    # 5) 失效的全表比例判据：按当前形态与档位取真名，改动越多失效面越大
+    span = f"{dshot['core_sec_min']:g}-{dshot['core_sec_max']:g}s"
+    global_checks = ["固定镜头占比", f"近中景({'/'.join(csizes)})占比",
+                     f"核心镜长({span})占比", "对白镜占比",
+                     "钩子断档", "单集时长", "镜数越界",
+                     # 同为全表判据：漏列等于告诉用户"这些没变的还能信"
+                     "锚点未命中", "分幕核对", "平台时长档"]
     stale = list(global_checks) if changed_set else []
+
 
     # 用最近一次全量结果做对照（若提供），标出本次改动是否引入了新的局部问题
     prev_local = set()
@@ -432,6 +909,8 @@ def render_changed(res: dict, title: str = "") -> str:
         for i in items:
             mark = "← 新引入" if f"{i['check']}@{i['value']}" in set(res["new_issues"]) else ""
             out.append(color(f"  · [{label}] {i['check']}: {i['value']}  限 {i['limit']}  {mark}"))
+            if i.get("fix"):
+                out.append(C.dim(f"      ↳ 失败模式「{i.get('failure', '?')}」 {i['fix']}"))
     if res["global_stale"]:
         out.append("")
         out.append(C.warn(f"  ! 以下全表判据因改动失效，须全量复算（{len(res['global_stale'])} 项）："))
@@ -443,8 +922,15 @@ def render_changed(res: dict, title: str = "") -> str:
 
 def render(res: dict, title: str = "", const: dict | None = None) -> str:
     b = res.get("baseline") or {}
-    _, _, dq = resolve_profile((const or CONST)["drama"], b.get("profile", "ai"))
+    dd = (const or CONST)["drama"]
+    if "form" not in dd:
+        dd = apply_form_profile({"drama": dd}, b.get("form", "live_action"),
+                                b.get("profile", "ai"))["drama"]
+    dshot, _ds, dq, _dp, _da = resolve_profile(dd)
+    csizes = res.get("close_sizes") or list(near_medium_set(dd))
     n, total = res["n"], res["total"]
+    FORM_NAME = {"live_action": "真人/AI 写实", "anime": "动漫短剧",
+                 "motion_comic": "动态漫", "static_comic": "静态漫"}
     out = [C.bold(f"\n  短剧分镜扫描 · {title or '(未命名)'}"), "  " + "─" * 56]
     out.append(f"  {n} 镜   {total:.0f}s（{int(total // 60)}分{int(total % 60)}秒）"
                f"   均值 {res['avg']}s   中位 {res['median']}s")
@@ -452,8 +938,12 @@ def render(res: dict, title: str = "", const: dict | None = None) -> str:
         rng = f" / {b['shots_min']}-{b['shots_max']} 镜" if b.get("shots_min") else ""
         tag = C.ok("项目覆盖") if b["source"] == "项目覆盖" else C.dim("全局默认")
         prof = b.get("profile", "ai")
+        frm = b.get("form", "live_action")
         ptag = C.ok("真人实拍档") if prof == "live" else C.dim("AI生成档")
-        out.append(C.dim(f"  基线  {tag}  {ptag}  目标 {b['target_s']}s{rng}"))
+        ftag = C.cyan(FORM_NAME.get(frm, frm))
+        asp = b.get("platform", "")
+        out.append(C.dim(f"  基线  {tag}  {ftag}  {ptag}  目标 {b['target_s']}s{rng}"
+                         + (f"  {asp}" if asp else "")))
     out.append("")
 
     out.append("  时长分布")
@@ -468,7 +958,7 @@ def render(res: dict, title: str = "", const: dict | None = None) -> str:
         out.append(f"    {k:<5} {v:>2} 镜  {v / n * 100:5.1f}%")
     out.append(f"  对白镜 {res['dialogue_n']}/{n} = {res['dlg_ratio'] * 100:.1f}%"
                f"   固定镜 {res['fixed_ratio'] * 100:.0f}%"
-               f"   近中景 {res['cm_ratio'] * 100:.0f}%"
+               f"   近中景 {'/'.join(csizes)} {res['cm_ratio'] * 100:.0f}%"
                f"   核心镜长 {res['core_ratio'] * 100:.0f}%")
 
     ok_w = len(res["windows"]) - res["hook_miss"]
@@ -476,6 +966,16 @@ def render(res: dict, title: str = "", const: dict | None = None) -> str:
     hook_color = C.ok if res["hook_miss"] == 0 else C.warn
     out.append("  钩子   " + hook_color(f"{ok_w}/{win_total} 窗口达标")
                + f"（每 {dq['hook_per_seconds']}s 一个）")
+
+    cinfo = res.get("comic") or {}
+    if cinfo.get("grids"):
+        out.append(f"  格     {cinfo['grids']} 格  "
+                   f"格组 {cinfo['grid_range'][0]}-{cinfo['grid_range'][1]}  "
+                   f"气泡上限 {cinfo.get('bubble_cap')} 字"
+                   + (f"  阅读顺序 {cinfo['reading_order']}" if cinfo.get("reading_order") else ""))
+    minfo = res.get("model") or {}
+    if minfo.get("max_shot_sec"):
+        out.append(C.dim(f"  后端模型单镜上限 {minfo['max_shot_sec']}s"))
 
     if res["act_check"]:
         out.append("")
@@ -494,6 +994,10 @@ def render(res: dict, title: str = "", const: dict | None = None) -> str:
             out.append(color(f"  ■ {label} ({len(items)})"))
             for i in items:
                 out.append(color(f"    · {i['check']}: {i['value']}  限 {i['limit']}"))
+                # 失败模式分类（[failure.modes]）：不只说"超了"，还说清怎么修
+                if i.get("fix"):
+                    tag = f"失败模式「{i.get('failure', '?')}」"
+                    out.append(C.dim(f"      ↳ {tag} {i['fix']}"))
 
     if not res["blocking"] and not res["warning"]:
         out.append(C.ok("\n  全部指标通过。"))
@@ -505,15 +1009,22 @@ def render(res: dict, title: str = "", const: dict | None = None) -> str:
     return "\n".join(out)
 
 
+
 def _opts() -> tuple[list[str], dict]:
     """解析 argv → (位置参数, 选项字典)。带值的选项不会被误当成位置参数。"""
-    valued = {"--format", "--changed", "--project", "--mode"}
+    valued = {"--format", "--changed", "--project", "--mode",
+              "--form", "--platform", "--model"}
     pos, opt, i = [], {}, 1
     while i < len(sys.argv):
         a = sys.argv[i]
-        if a in valued and i + 1 < len(sys.argv):
-            opt[a] = sys.argv[i + 1]
-            i += 2
+        if a in valued:
+            # 带值选项：即使后面是另一个 --flag 或已到末尾，也不能把它吞进选项值
+            if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--"):
+                opt[a] = sys.argv[i + 1]
+                i += 2
+                continue
+            opt[a] = ""
+            i += 1
             continue
         if a.startswith("--"):
             opt[a] = True
@@ -528,7 +1039,8 @@ def main():
     pos, opt = _opts()
     if not pos:
         print("用法: python scan.py <分镜表.md|.csv> [--json] [--format single|series] "
-              "[--mode ai|live] [--changed N,M] [--project <项目目录>]")
+              "[--mode ai|live] [--form live_action|anime|motion_comic|static_comic] "
+              "[--platform 名] [--model 名] [--changed N,M] [--project <项目目录>]")
         return 1
     path = Path(pos[0])
     if not path.exists():
@@ -539,7 +1051,8 @@ def main():
     # 项目级阈值覆盖：显式 --project 优先，否则从分镜表所在目录向上自动查找。
     # 没有这一步，1 分钟短剧会被 140 秒的全局基线误报"时长偏离 / 镜数越界"。
     proj_root = Path(opt["--project"]) if opt.get("--project") else find_project_root(path)
-    const = constants_for(proj_root) if proj_root else CONST
+    const = constants_for(proj_root, form=opt.get("--form")) if proj_root \
+        else constants_for(None, form=opt.get("--form"))
     # 档位：--mode 显式指定 > 项目/全局 [drama] shot_profile > ai
     mode = str(opt.get("--mode") or const["drama"].get("shot_profile", "ai"))
 
@@ -566,10 +1079,13 @@ def main():
               else render_changed(res, path.parent.name))
         return 0
 
-    res = analyze(shots, fmt=fmt, text=text, const=const, mode=mode)
+    res = analyze(shots, fmt=fmt, text=text, const=const, mode=mode,
+                  platform=opt.get("--platform"), model=opt.get("--model"),
+                  is_ai=not opt.get("--live-shoot"))
     print(json.dumps(res, ensure_ascii=False, indent=2) if opt.get("--json")
           else render(res, path.parent.name, const=const))
-    return 0
+    return 0 if not res["blocking"] else 1
+
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# 短剧工坊 · 短剧 / 漫剧的剧本与分镜产出系统
+# 短剧工坊 · 短剧 / 动漫短剧 / 漫剧的剧本与分镜产出系统
 
 一句话：**结构先行，镜头后配，格式定死。**
 
@@ -17,16 +17,37 @@
 
 这些都不是审美问题，是**可以机械检查的**问题。本项目只做机械检查。
 
+## 四种形态
+
+**形态 = 画面从哪来**，与"拍什么题材"无关。换形态就是换媒介，得换尺子。
+
+| 形态 | `--form` | 画面来源 | 对白走 | 有"格" |
+|---|---|---|---|---|
+| 真人 / AI 写实短剧 | `live_action` | 连续视频 | 配音 / 同期声 | 否 |
+| 动漫短剧 | `anime` | 连续动画 | 配音 | 否 |
+| 漫剧（动态漫） | `motion_comic` | 静态帧 + 推拉 | 气泡 | 是 |
+| 静态漫 / 条漫 | `static_comic` | 静态格，无运镜 | 气泡 | 是 |
+
+形态之外还有**档位**（`--mode`）：`ai` 生成（单镜 3-4 秒最稳）vs `live` 真人实拍
+（长镜省机位）。两者**正交**，可自由组合。
+
+```bash
+python engine/dramakit.py forms    # 列全部形态与判据差异
+```
+
 ## 能做什么
 
 | 命令 | 作用 |
 |---|---|
-| `dramakit new` | 建项目骨架（README / 节拍表 / 分镜表 / 分集表） |
-| `dramakit plan` | 按配比算出四段时长，或排出系列分集表与卡点位置 |
+| `dramakit new` | 建项目骨架（节拍表 / 分镜表 / 分集表 / 跨集台账） |
+| `dramakit plan` | 按配比算四段时长，或排系列分集表；核对平台时长档 |
 | `dramakit skel` | 按节拍与核心镜长，算出每段该给几镜，排出空表 |
-| `dramakit scan` | 分镜表质检：时长 / 镜数 / 镜头语言 / 钩子密度 / 对白占比 |
-| `dramakit check` | 交付格式校验：五块结构、六列表头、验收额度 |
-| `dramakit selftest` | 36 项回归断言，秒级，不耗 token |
+| `dramakit scan` | 分镜表质检：时长 / 镜数 / 镜头语言 / 钩子密度 / 合规 / 模型上限 |
+| `dramakit check` | 交付格式校验：五块结构、列头、验收额度、AIGC 标识 |
+| `dramakit continuity` | 跨集一致性对账（连载专用）：时间轴 / 角色 / 场景 / 伏笔 |
+| `dramakit forms` | 列出所有形态与判据差异 |
+| `dramakit spec` | 查看平台 / 后端规格 |
+| `dramakit selftest` | 75 项回归断言（14 组用例），秒级，不耗 token |
 
 ## 不能做什么
 
@@ -42,30 +63,29 @@ cd 短剧工坊
 # 环境自检
 python engine/dramakit.py doctor
 
-# 立项（单集完结）
+# 立项（真人单集完结）
 python engine/dramakit.py new 我的剧 "一句话灵感"
 
-# 看四段节拍
-python engine/dramakit.py plan 我的剧
+# 立项（漫剧连载，60 集）
+python engine/dramakit.py new 我的漫剧 "一句话灵感" --format series --form motion_comic --episodes 60
+
+# 看四段节拍 + 平台时长档
+python engine/dramakit.py plan 我的剧 --platform hongguo
 
 # 生成分镜骨架并写入
 python engine/dramakit.py skel 我的剧 --write
 
 # 填完动作和台词后质检
-python engine/dramakit.py scan 我的剧/分镜表.md
+python engine/dramakit.py scan 我的剧/分镜表.md --model seedance
 
 # 定稿前校验交付格式
 python engine/dramakit.py check 我的剧/我的剧.md
+
+# 连载项目对账
+python engine/dramakit.py continuity 我的漫剧
 ```
 
-系列连载：
-
-```bash
-python engine/dramakit.py new 我的系列 "一句话灵感" --format series --episodes 60
-python engine/dramakit.py plan 我的系列 --episode
-```
-
-## 两种镜头语言档位
+## 两个正交的维度：形态 × 档位
 
 **判据方向是反的，不能共用一把尺子。**
 
@@ -88,6 +108,12 @@ python engine/dramakit.py scan 我的剧/分镜表.md --mode live
 
 或在项目 `config/overrides.toml` 里写 `shot_profile = "live"`，之后自动生效。
 
+## 判据在哪
+
+全部在 `config/dramakit.toml`。代码里没有硬编码阈值——改一个数，全套判据跟着变。
+项目级差异写 `<项目>/config/overrides.toml`，深覆盖全局值，
+优先级 **项目覆盖 > 形态 > 档位 > 全局基线**。
+
 ## 目录
 
 ```
@@ -95,23 +121,18 @@ python engine/dramakit.py scan 我的剧/分镜表.md --mode live
 ├── engine/
 │   ├── dramakit.py        # 命令行入口
 │   └── lib/
-│       ├── common.py      # 常数加载 / 档位解析 / 终端着色
+│       ├── common.py      # 常数加载 / 形态档位解析 / 平台模型规格
 │       ├── plan.py        # 节拍与分集表
 │       ├── shotlist.py    # 分镜骨架 + 交付校验
 │       ├── scan.py        # 分镜表质检
+│       ├── continuity.py  # 跨集一致性
 │       └── selftest.py    # 回归自检
 ├── config/dramakit.toml   # 唯一常数表，代码里不写死数字
-├── references/            # 结构 / 镜头 / 交付 三份规范
+├── references/            # 结构 / 镜头 / 形态 / 规格 / 交付 五份规范
 ├── projects/              # 一个项目一个目录
 │   └── 示例-十七楼/        # 9 镜 61 秒，可直接跑
 └── _test/
 ```
-
-## 判据在哪
-
-全部在 `config/dramakit.toml`。代码里没有硬编码阈值——改一个数，全套判据跟着变。
-项目级差异写 `<项目>/config/overrides.toml`，深覆盖全局值，
-优先级 **项目覆盖 > 档位 > 全局基线**。
 
 ## 版权
 

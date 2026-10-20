@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-from common import CONST, C
+from common import CONST, C, platform_for
 
 # 单集四段：名字 / 功能 / 必须发生的事 / 结尾状态
 ACTS = [
@@ -31,6 +31,7 @@ ACTS = [
 
 # 钩子类型：每段结尾挂哪一种
 ACT_HOOKS = ["不对劲", "逼到眼前", "认知翻转", "留白"]
+
 
 
 def _sec(v) -> float:
@@ -64,8 +65,10 @@ def beats(const: dict | None = None, total_s: float | None = None) -> list[dict]
     return out
 
 
-def render_beats(const: dict | None = None, total_s: float | None = None) -> str:
-    d = (const or CONST)["drama"]
+def render_beats(const: dict | None = None, total_s: float | None = None,
+                 platform: str | None = None) -> str:
+    c = const or CONST
+    d = c["drama"]
     rows = beats(const, total_s)
     total = sum(r["sec"] for r in rows)
     out = [C.bold(f"\n  单集节拍 · 目标 {total:.0f}s"), "  " + "─" * 56]
@@ -80,7 +83,15 @@ def render_beats(const: dict | None = None, total_s: float | None = None) -> str
     lo = d["single"]["shots_min"]
     hi = d["single"]["shots_max"]
     out.append(C.dim(f"  镜数区间 {lo}-{hi}（{d['shot']['core_sec_min']}-{d['shot']['core_sec_max']}s 核心镜为主）"))
+    spec = platform_for(c, platform)
+    band = spec.get("duration_band") or []
+    if band:
+        ok = band[0] <= total <= band[1]
+        tag = C.ok("✓ 在档") if ok else C.err("✗ 不在档")
+        out.append(C.dim(f"  平台 {spec.get('note', '')}  {spec.get('aspect', '')}"
+                         f"  {band[0]:.0f}-{band[1]:.0f}s  {tag}"))
     return "\n".join(out)
+
 
 
 # ------------------------------------------------------------
