@@ -27,6 +27,17 @@ COLUMNS = ["镜", "时长", "景别", "谁在画面", "动作一句话", "台词
 # 视频交付要的是"能演的动作"，漫画交付要的是"能画的画面 + 装得下的气泡"。
 COMIC_COLUMNS = ["镜", "时长", "景别", "谁在画面", "画面一句话", "气泡对白"]
 
+# 工作表的列头（骨架表）。**和交付列头是两套东西，别混**：
+# 交付表是给人看和拍的，工作表现在还要能喂给 scan（运镜/声音）与
+# 填表人（开场站位）。多出来的列不是冗余，是"填之前必须先决定的东西"。
+WORK_COLUMNS = ["镜", "时长", "景别", "运镜", "开场站位", "画面", "台词", "声音"]
+WORK_COLUMNS_PANEL = ["镜", "时长", "景别", "运镜", "开场站位", "画面一句话", "气泡对白"]
+
+# 骨架里的占位提示。空表最容易出的事是"填的人不知道这列要什么"，
+# 于是把"开场站位"写成"两人在客厅"——那等于没定。
+STAGING_HINT = "（待填：谁在左/右·朝向）"
+VISUAL_HINT = "（待填：谁｜动作）"
+
 # 有"格"的形态（交付用漫画列头）。**只有两种漫**——动漫短剧是连续动画，
 # 交付仍是视频列头（要的是"能演的动作"与"台词原文"，不是"气泡对白"）。
 PANEL_FORMS = ("motion_comic", "static_comic")
@@ -41,6 +52,17 @@ def delivery_columns(const: dict | None = None, form: str | None = None) -> list
     if frm in PANEL_FORMS:
         return list(d.get("delivery", {}).get("comic_columns") or COMIC_COLUMNS)
     return list(d.get("delivery", {}).get("shot_columns") or COLUMNS)
+
+
+def work_columns(const: dict | None = None, form: str | None = None) -> list:
+    """骨架表该用哪套列头。比交付多「运镜」「开场站位」，少「谁在画面」——
+    人物并进"画面"写成"谁｜动作"，与交付表的合并方式一致。"""
+    d = (const or CONST)["drama"]
+    frm = normalize_form(form or d.get("form") or "live_action")
+    w = d.get("work") or {}
+    if frm in PANEL_FORMS:
+        return list(w.get("panel_columns") or WORK_COLUMNS_PANEL)
+    return list(w.get("shot_columns") or WORK_COLUMNS)
 
 
 
@@ -75,14 +97,23 @@ def skeleton(const: dict | None = None, total_s: float | None = None,
             no += 1
             rows.append({
                 "no": no, "act": b["name"], "sec": step,
-                "size": default_size, "who": "", "action": "", "line": "",
+                "size": default_size, "move": "固定", "staging": "",
+                "visual": "", "line": "", "sound": "",
             })
     return rows
 
 
+# 列名 → 行字段。渲染与解析共用同一张表，改名时只改一处。
+_COL_FIELD = {"镜": "no", "时长": "sec", "景别": "size", "运镜": "move",
+              "开场站位": "staging", "画面": "visual", "画面一句话": "visual",
+              "台词": "line", "气泡对白": "line", "声音": "sound"}
+
+
 def render_md(rows: list[dict], title: str = "", const: dict | None = None,
               form: str | None = None) -> str:
-    cols = delivery_columns(const, form or ((const or CONST)["drama"].get("form")))
+    """渲染骨架表。**按列头驱动，不按固定 6 格拼**——
+    早先这里是写死的六个 `{}`，加一列就整表错位。"""
+    cols = work_columns(const, form or ((const or CONST)["drama"].get("form")))
     out = []
     if title:
         out.append(f"## 分镜表 · {title}")
@@ -90,9 +121,26 @@ def render_md(rows: list[dict], title: str = "", const: dict | None = None,
     out.append("| " + " | ".join(cols) + " |")
     out.append("|" + "|".join(["---"] * len(cols)) + "|")
     for r in rows:
-        out.append("| {} | {}s | {} | {} | {} | {} |".format(
-            r["no"], r["sec"], r["size"], r["who"] or "（待填）",
-            r["action"] or "（待填）", r["line"] or "—"))
+        cells = []
+        for c in cols:
+            k = _COL_FIELD.get(c)
+            if c == "镜":
+                cells.append(str(r["no"]))
+            elif c == "时长":
+                cells.append(f"{r['sec']}s")
+            elif c == "开场站位":
+                cells.append(r.get("staging") or STAGING_HINT)
+            elif c in ("画面", "画面一句话"):
+                cells.append(r.get("visual") or VISUAL_HINT)
+            elif c in ("台词", "气泡对白"):
+                cells.append(r.get("line") or "—")
+            elif c == "声音":
+                cells.append(r.get("sound") or "无")
+            elif k:
+                cells.append(r.get(k) or "（待填）")
+            else:
+                cells.append("")
+        out.append("| " + " | ".join(cells) + " |")
     return "\n".join(out)
 
 

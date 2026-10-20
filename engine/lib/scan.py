@@ -135,8 +135,58 @@ def _norm_sec(v) -> float:
     return float(m.group(1)) if m else 0.0
 
 
+# 表头 → 字段。**按表头解析，不按列数**。
+# 踩过的坑：早先按列数分派（6 列=交付、7 列=工作），骨架表一加"开场站位"
+# 就变成 7 列，整张交付表被当成工作格式解析——列错位、判据全废，且不报错。
+# 加列是常态，列数不是身份，表头才是。
+_HEAD = {
+    "镜": "no", "镜号": "no",
+    "时长": "sec", "秒": "sec",
+    "景别": "size",
+    "运镜": "move", "镜头": "move", "机位": "move",
+    "谁在画面": "who", "人物": "who",
+    "开场站位": "staging", "站位": "staging",
+    "动作一句话": "action", "动作": "action",
+    "画面": "visual", "画面一句话": "visual",
+    "台词原文": "line", "台词": "line", "对白": "line", "气泡对白": "line",
+    "声音": "sound", "音效": "sound",
+    "英文提示词": "prompt_en", "提示词": "prompt_en",
+}
+
+
+def _assemble(rec: dict) -> dict:
+    """把按表头取到的原始单元格拼成统一的镜头 dict。
+
+    visual 的语义是"这一镜看得见什么"，交付表把它拆成「谁在画面 + 动作」
+    两列，工作表则直接给一列「画面」。两种写法都要归到同一个字段上，
+    否则下游（quality 的 _who_names、scan 的词表）就得各写一套分支。
+    """
+    who = rec.get("who", "")
+    if "visual" in rec:
+        visual = rec["visual"]
+        if who:
+            visual = f"{who}｜{visual}"
+    else:
+        visual = "｜".join(x for x in (who, rec.get("action", "")) if x)
+    shot = {
+        "no": int(rec["no"]), "sec": _norm_sec(rec.get("sec", 0)),
+        "size": rec.get("size", ""), "move": rec.get("move", "固定"),
+        "visual": visual, "line": rec.get("line", ""),
+        "sound": rec.get("sound", ""),
+        "prompt_en": rec.get("prompt_en", ""),
+    }
+    # staging 只在表里真有这一列时才带上——交付稿没有这一列，
+    # 凭空塞一个空字符串会让"覆盖率"把交付稿也算成"站位全没填"。
+    if "staging" in rec:
+        shot["staging"] = rec["staging"]
+    return shot
+
+
 def parse_shotlist(text: str) -> list[dict]:
-    """解析主分镜表：md 表格（7 列）或 csv（8 列，末列英文提示词）。"""
+    """解析主分镜表：md 表格或 csv（8 列，末列英文提示词）。
+
+    md 走**表头映射**；表头认不出来才退回列数分派，保住老文件的兼容。
+    """
     stripped = text.lstrip("\ufeff")
     shots = []
 
@@ -154,13 +204,35 @@ def parse_shotlist(text: str) -> list[dict]:
             })
         return shots
 
+    header, raw = None, []
     for line in stripped.splitlines():
         line = line.strip()
         if not line.startswith("|"):
             continue
         cells = [c.strip() for c in line.strip("|").split("|")]
+        if not cells:
+            continue
+        if header is None:
+            if cells[0] in ("镜", "镜号"):
+                header = cells
+            continue
         if not cells[0].isdigit():
             continue
+        raw.append(cells)
+
+    # 表头映射成功（至少认出镜号与时长）就走映射；否则退回列数分派
+    if header and sum(1 for h in header if h in _HEAD) >= 4:
+        for cells in raw:
+            rec = {}
+            for h, c in zip(header, cells):
+                k = _HEAD.get(h)
+                if k and k not in rec:
+                    rec[k] = c
+            if "no" in rec:
+                shots.append(_assemble(rec))
+        return shots
+
+    for cells in raw:
         if len(cells) == 7:
             # 工作格式：镜|时长|景别|运镜|画面|台词|声音
             shots.append({
@@ -176,8 +248,8 @@ def parse_shotlist(text: str) -> list[dict]:
             shots.append({
                 "no": int(cells[0]), "sec": _norm_sec(cells[1]),
                 "size": cells[2], "move": "固定",
-                "visual": f"{cells[3]}｜{cells[4]}", "line": cells[5], "sound": "",
-                "prompt_en": "",
+                "visual": f"{cells[3]}｜{cells[4]}", "line": cells[5],
+                "sound": "", "prompt_en": "",
             })
     return shots
 
@@ -598,6 +670,24 @@ def platform_checks(text: str, total_s: float, fmt: str, d: dict,
 
 
 
+def staging_coverage(shots: list[dict]) -> dict | None:
+    """开场站位覆盖率。**只在表里真有这一列时才算。**
+
+    为什么不做成阻断：站位是"填之前先定死"的预置，不是判据。
+    没填不代表戏错了，只代表"位置还没决定"——而位置没决定，
+    跨镜就会出现上一镜她在左、下一镜她在右，观众说不出哪里不对，只觉得怪。
+    所以这里只报数，不拦稿。
+    """
+    if not shots or not any("staging" in s for s in shots):
+        return None
+    hints = ("（待填）", "（待填：谁在左/右·朝向）", "待填", "—", "-", "")
+    empty = [s for s in shots
+             if (s.get("staging") or "").strip() in hints]
+    return {"n": len(shots), "empty": len(empty),
+            "filled": len(shots) - len(empty),
+            "shots": [s["no"] for s in empty]}
+
+
 def analyze(shots: list[dict], fmt: str = "single", text: str = "",
             const: dict | None = None, mode: str = "ai",
             form: str | None = None, platform: str | None = None,
@@ -764,6 +854,7 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
         "close_sizes": list(csizes),
         "windows": wins, "hook_miss": len(miss),
         "act_check": act_check, "act_drift": act_drift,
+        "staging": staging_coverage(shots),
         "comic": cinfo, "compliance": kinfo, "model": minfo, "platform": pinfo,
         "blocking": blocking, "warning": warning,
         "baseline": {
@@ -968,6 +1059,12 @@ def render(res: dict, title: str = "", const: dict | None = None) -> str:
                + f"（每 {dq['hook_per_seconds']}s 一个）")
 
     cinfo = res.get("comic") or {}
+    stg = res.get("staging")
+    if stg and stg.get("empty"):
+        out.append("  站位   " + C.warn(f"{stg['filled']}/{stg['n']} 已填")
+                   + C.dim(f"   未填镜 {'/'.join(str(x) for x in stg['shots'][:8])}"
+                           f"{'…' if len(stg['shots']) > 8 else ''}"
+                           "（分镜前先定死左右与朝向）"))
     if cinfo.get("grids"):
         out.append(f"  格     {cinfo['grids']} 格  "
                    f"格组 {cinfo['grid_range'][0]}-{cinfo['grid_range'][1]}  "

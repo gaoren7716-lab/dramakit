@@ -53,7 +53,7 @@ FORM_ALIAS = {"comic": "motion_comic", "live": "live_action", "ai": "live_action
 # 形态专属要替换的表。live_action 没有专属块，直接用全局基线。
 # panel 是"格"（漫剧/静态漫独有），asset 是资产台账（动画/漫画独有），
 # hook 是秒级锚点表（各形态爆破节奏不同，容差要跟着变）。
-FORM_TABLES = ("shot", "single", "quality", "panel", "asset", "hook", "story")
+FORM_TABLES = ("shot", "single", "quality", "panel", "asset", "hook", "story", "work")
 
 # 哪些形态有"格"（一组格完成一个起承转合）——只有两种漫。
 # 动漫短剧是连续动画，用影视景别与视频交付，不算"格"形态。

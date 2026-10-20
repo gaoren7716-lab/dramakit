@@ -10,6 +10,8 @@
     python engine/dramakit.py continuity 我的剧
     python engine/dramakit.py forms
     python engine/dramakit.py spec [--platform 名] [--model 名]
+    python engine/dramakit.py quality 我的剧/我的剧.md
+    python engine/dramakit.py progress 我的剧
     python engine/dramakit.py selftest
     python engine/dramakit.py doctor
 """
@@ -59,8 +61,36 @@ def resolve_project(name: str) -> Path:
 # new
 # ------------------------------------------------------------
 
+def _write_plan(files: dict, root: Path, dry: bool) -> int:
+    """干跑：先把"要写哪些文件、各多大"说清楚，再决定写不写。
+
+    为什么默认要过这一道：写盘是**不可逆**的动作，而错误往往不是内容错，
+    是"写到了不该写的地方"（同名项目覆盖、路径拼错）。先打印清单，
+    一眼就能看出不对——这比事后 git diff 便宜得多。
+    ★ 本项目不调模型、不产生费用，所以"计费双确认"在这里不成立，
+      只吸收"写盘前先干跑"这一半，且老实写在文档里。
+    """
+    total = sum(len(t.encode("utf-8")) for t in files.values())
+    print(C.bold(f"\n  将写入 {len(files)} 个文件，共 {total} 字节"))
+    for p, t in files.items():
+        try:
+            rel = p.relative_to(root.parent)
+        except ValueError:
+            rel = p
+        print(f"    {rel}   {len(t.encode('utf-8'))} B")
+    if dry:
+        print(C.dim("\n  干跑：未写盘。确认无误后去掉 --dry-run 再跑一次。"))
+        return 0
+    root.mkdir(parents=True, exist_ok=True)
+    for p, t in files.items():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(t, encoding="utf-8")
+    return 1
+
+
 def cmd_new(args):
     import plan as PL
+    import progress as PG
     import shotlist as SL
 
     name = args.project
@@ -69,38 +99,49 @@ def cmd_new(args):
     proj = PROJECTS_DIR / name
     if proj.exists() and not args.force:
         raise SystemExit(f"项目已存在：{proj}（要重建加 --force）")
-    (proj / "config").mkdir(parents=True, exist_ok=True)
 
     meta = {"name": name, "genre": args.genre, "format": fmt, "form": frm,
             "version": CONST["drama"]["meta"]["version"]}
-    (proj / "project.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    (proj / "README.md").write_text(
-        SL.project_readme(name, args.genre, fmt, form=frm), encoding="utf-8")
 
     # 骨架与列头必须跟随形态：漫剧形态要用"中格"与气泡列头，
     # 直接取全局 CONST 会生成"中景 / 动作一句话"的视频表（实测 bug）。
     const = constants_for(proj, form=frm)
+    files = {
+        proj / "project.json": json.dumps(meta, ensure_ascii=False, indent=2),
+        proj / "README.md": SL.project_readme(name, args.genre, fmt, form=frm),
+    }
     if fmt == "series":
         n = args.episodes or CONST["drama"]["series"]["episodes_default"]
-        (proj / "分集表.md").write_text(PL.episodes_md(n, const) + "\n", encoding="utf-8")
-        (proj / "第01集-分镜表.md").write_text(
-            SL.render_md(SL.skeleton(const), const=const) + "\n", encoding="utf-8")
-    else:
-        (proj / "节拍表.md").write_text(PL.beats_md(const) + "\n", encoding="utf-8")
-        (proj / "分镜表.md").write_text(
-            SL.render_md(SL.skeleton(const), const=const) + "\n", encoding="utf-8")
-
-    # 连载项目同时给一份跨集台账骨架，否则写到第 20 集就没人记得第 3 集登记了什么
-    if fmt == "series":
+        files[proj / "分集表.md"] = PL.episodes_md(n, const) + "\n"
+        files[proj / "第01集-分镜表.md"] = (
+            SL.render_md(SL.skeleton(const), const=const) + "\n")
+        # 连载项目同时给一份跨集台账骨架，否则写到第 20 集
+        # 就没人记得第 3 集登记了什么
         import continuity as CY
-        (proj / "continuity.md").write_text(CY.TEMPLATE.format(name=name) + "\n",
-                                            encoding="utf-8")
+        files[proj / "continuity.md"] = CY.TEMPLATE.format(name=name) + "\n"
+    else:
+        files[proj / "节拍表.md"] = PL.beats_md(const) + "\n"
+        files[proj / "分镜表.md"] = SL.render_md(SL.skeleton(const), const=const) + "\n"
+
+    if not _write_plan(files, proj, args.dry_run):
+        return 0
+    # 空目录不写进计划里（没有内容可写），但它是给 overrides.toml 留的位置
+    (proj / "config").mkdir(parents=True, exist_ok=True)
+
+    # 立项只记"结构文件"的指纹。把节拍表/分镜表也记进来是错的：
+    # 那两张表后面一定要改，一改就把"立项"标成产物变更，噪音淹掉真信号。
+    PG.record(proj, "new", [proj / "project.json", proj / "README.md"],
+              note=f"{FORM_NAME.get(frm, frm)} · {fmt}")
+    # 立项同时产出了分镜骨架（分镜表.md 就是骨架表），一并记上——
+    # 否则 progress 会把"骨架已存在但没记录"显示成未做，让人以为还要再跑一次。
+    skel_out = [proj / ("第01集-分镜表.md" if fmt == "series" else "分镜表.md")]
+    PG.record(proj, "skel", skel_out, note="随立项生成")
 
     print(C.bold(f"\n  已建立：{proj}"))
     print(C.dim(f"  形态 {FORM_NAME.get(frm, frm)} · 规模 {fmt} · 题材 {args.genre}"))
     for f in sorted(proj.iterdir()):
-        print(f"    {f.name}")
+        if f.is_file():
+            print(f"    {f.name}")
     print(C.dim("\n  下一步：填 README 的一句话 → 过 plan 看节拍 → 填分镜表 → scan 质检"))
     return 0
 
@@ -147,18 +188,24 @@ def cmd_plan(args):
 # ------------------------------------------------------------
 
 def cmd_skel(args):
+    import progress as PG
     import shotlist as SL
     proj = resolve_project(args.project)
     meta = _proj_meta(proj)
     const = constants_for(proj, args.mode, form=args.form or meta.get("form"))
     rows = SL.skeleton(const, args.total)
     md = SL.render_md(rows, proj.name, const=const)
-    if args.write:
-        out = proj / "分镜表.md"
-        out.write_text(md + "\n", encoding="utf-8")
-        print(C.ok(f"  已写入 {out}（{len(rows)} 镜）"))
-    else:
+    out = proj / "分镜表.md"
+    if not args.write:
         print(md)
+        print(C.dim(f"\n  干跑：以上是骨架内容，未写盘。加 --write 落到 {out.name}。"))
+        return 0
+    if args.dry_run:
+        _write_plan({out: md + "\n"}, proj, True)
+        return 0
+    _write_plan({out: md + "\n"}, proj, False)
+    PG.record(proj, "skel", [out], note=f"{len(rows)} 镜")
+    print(C.ok(f"  已写入 {out}（{len(rows)} 镜）"))
     return 0
 
 
@@ -194,13 +241,31 @@ def cmd_scan(args):
                                  mode=mode, model=args.model, is_ai=is_ai)
         print(json.dumps(res, ensure_ascii=False, indent=2) if args.json
               else SC.render_changed(res, p.parent.name))
+        if args.record:
+            # 增量扫只重检了被改的镜头，全表比例判据是 stale 的——
+            # 记成"质检完成"就是撒谎，宁可明说这次不记。
+            print(C.warn("  增量重扫不记进度（全表判据未复算，记了等于撒谎）"))
         return 0
 
     res = SC.analyze(shots, fmt=fmt, text=text, const=const, mode=mode,
                      platform=args.platform, model=args.model, is_ai=is_ai)
     print(json.dumps(res, ensure_ascii=False, indent=2) if args.json
           else SC.render(res, p.parent.name, const=const))
+    if args.record and proj:
+        import progress as PG
+        PG.record(proj, "scan", [p],
+                  note=f"{len(res['blocking'])} 阻断 / {len(res['warning'])} 警告")
     return 0 if not res["blocking"] else 1
+
+
+def cmd_progress(args):
+    import progress as PG
+    proj = resolve_project(args.project)
+    rows = PG.status(proj)
+    hint = PG.next_step(proj, rows)
+    print(json.dumps({"stages": rows, "next": hint}, ensure_ascii=False, indent=2)
+          if args.json else PG.render(rows, proj.name, hint))
+    return 0
 
 
 def cmd_check(args):
@@ -211,8 +276,12 @@ def cmd_check(args):
     proj = find_project_root(p)
     frm = args.form or (_proj_meta(proj).get("form") if proj else None)
     const = constants_for(proj, form=frm)
+    # 和 scan 同一条规矩：is_ai 跟着解析出的档位走。
+    # 真人项目被要求"AIGC 标识"是尺子用反了——它本来就不是 AI 生成的。
+    mode = str(const["drama"].get("shot_profile", "ai"))
+    is_ai = False if args.live_shoot else (mode != "live")
     res = SL.check_delivery(p.read_text(encoding="utf-8"), const,
-                            form=frm, is_ai=not args.live_shoot)
+                            form=frm, is_ai=is_ai)
     print(SL.render_check(res, p.stem))
     return 0 if res["ok"] else 1
 
@@ -354,7 +423,9 @@ def build_parser():
     s.add_argument("--format", choices=["single", "series"])
     s.add_argument("--form", choices=list(FORMS), help="形态（默认 live_action）")
     s.add_argument("--episodes", type=int)
-    s.add_argument("--force", action="store_true")
+    s.add_argument("--force", action="store_true", help="目标已存在时覆盖")
+    s.add_argument("--dry-run", action="store_true",
+                   help="只打印将写入的文件清单，不落盘")
     s.set_defaults(fn=cmd_new)
 
     s = sub.add_parser("plan", help="看节拍表 / 分集表")
@@ -371,6 +442,8 @@ def build_parser():
     s = sub.add_parser("skel", help="生成分镜骨架")
     s.add_argument("project")
     s.add_argument("--write", action="store_true", help="写入 分镜表.md")
+    s.add_argument("--dry-run", action="store_true",
+                   help="与 --write 同用时只打印写入清单，不落盘")
     s.add_argument("--total", type=float)
     s.add_argument("--mode", choices=["ai", "live"])
     s.add_argument("--form", choices=list(FORMS))
@@ -387,6 +460,8 @@ def build_parser():
     s.add_argument("--live-shoot", action="store_true", help="标记真人实拍（不查 AIGC 标识）")
     s.add_argument("--changed", help="增量重扫：3,5 或 3-7")
     s.add_argument("--project", help="显式指定项目根")
+    s.add_argument("--record", action="store_true",
+                   help="把本次结论与分镜表指纹记进 .progress.json")
     s.set_defaults(fn=cmd_scan)
 
     s = sub.add_parser("check", help="交付格式校验")
@@ -414,6 +489,11 @@ def build_parser():
     s.add_argument("--form", choices=list(FORMS))
     s.add_argument("--project", help="显式指定项目根")
     s.set_defaults(fn=cmd_quality)
+
+    s = sub.add_parser("progress", help="看项目做到哪一步（断点续跑）")
+    s.add_argument("project")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_progress)
 
     sub.add_parser("selftest", help="回归自检").set_defaults(fn=cmd_selftest)
     sub.add_parser("doctor", help="环境自检").set_defaults(fn=cmd_doctor)

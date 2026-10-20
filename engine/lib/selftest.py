@@ -692,6 +692,91 @@ def t_wiring():
     check("scan.py 直调也不误拦",
           "单镜超模型时长上限" not in r3.stdout, r3.stdout[-300:])
 
+    # check 是第三个要看档位的地方：真人项目不该被要求 AIGC 标识
+    r4 = subprocess.run([sys.executable, str(cli), "check",
+                         str(root / "projects" / "示例-十七楼" / "十七楼.md")],
+                        capture_output=True, text=True, encoding="utf-8", cwd=str(root))
+    check("真人项目 check 不要求 AIGC 标识",
+          "AIGC" not in r4.stdout, r4.stdout[-300:])
+
+
+def t_progress():
+    """断点续跑 + 开场站位 + 干跑，三件一起验。
+
+    断点续跑的关键判据是**指纹不是 mtime**：内容没变就不该报"产物已变更"，
+    内容变了就必须报——这两条反过来任意一条，进度文件就成了噪音。
+    """
+    import progress as PG
+
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td)
+        # 立项文件要在，否则 next_step 会先说"去立项"，测不到重扫那条分支
+        (proj / "project.json").write_text("{}", encoding="utf-8")
+        f = proj / "分镜表.md"
+        f.write_text("| 镜 | 时长 |\n|---|---|\n| 1 | 3s |\n", encoding="utf-8")
+        PG.record(proj, "scan", [f], note="1 阻断")
+        rows = {r["stage"]: r["state"] for r in PG.status(proj)}
+        check("记录后状态为完成", rows["scan"] == "完成", rows["scan"])
+
+        # 只碰 mtime、内容不变 → 仍应完成（证明没在用 mtime 判）
+        import os
+        os.utime(f, (1, 1))
+        rows = {r["stage"]: r["state"] for r in PG.status(proj)}
+        check("只改 mtime 不算变更", rows["scan"] == "完成", rows["scan"])
+
+        # 内容变了 → 必须报变更，且 next_step 要指向重扫
+        f.write_text("| 镜 | 时长 |\n|---|---|\n| 1 | 4s |\n", encoding="utf-8")
+        rows = {r["stage"]: r["state"] for r in PG.status(proj)}
+        check("内容变了要报产物变更", "变更" in rows["scan"], rows["scan"])
+        hint = PG.next_step(proj, PG.status(proj))
+        check("变更后下一步指向重扫", "--record" in hint, hint)
+
+        # 产物被删 → 报缺失，不是报完成
+        f.unlink()
+        rows = {r["stage"]: r["state"] for r in PG.status(proj)}
+        check("产物缺失要报缺失", "缺失" in rows["scan"], rows["scan"])
+
+    # 干跑：写盘函数在 dry 模式下不许碰盘
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "proj"
+        files = {root / "a.md": "aaa", root / "sub" / "b.md": "bbbb"}
+        import contextlib
+        import io as _io
+        # dramakit 在 engine/ 下，lib/ 里 import 不到——不能指望调用方已经把
+        # 路径加好（`python -c` 直接跑 selftest 时会 ModuleNotFound）
+        _eng = str(Path(__file__).resolve().parents[1])
+        if _eng not in sys.path:
+            sys.path.insert(0, _eng)
+        import dramakit as DK
+        with contextlib.redirect_stdout(_io.StringIO()):   # 别把清单打进自检输出
+            DK._write_plan(files, root, dry=True)
+        check("干跑不落盘", not root.exists(), str(root))
+        with contextlib.redirect_stdout(_io.StringIO()):
+            DK._write_plan(files, root, dry=False)
+        check("确认后落盘", all(p.exists() for p in files), str(root))
+
+    # 开场站位：骨架要带这一列，且能往返解析
+    rows = SL.skeleton()
+    check("骨架行带 staging 字段", all("staging" in r for r in rows))
+    md = SL.render_md(rows[:2], "站位验证")
+    check("骨架表有开场站位列", "开场站位" in md.splitlines()[2], md.splitlines()[2][:60])
+    filled = md.replace(SL.STAGING_HINT, "周宁靠门框左，朝向镜头", 1)
+    shots = SC.parse_shotlist(filled)
+    check("开场站位能往返解析",
+          shots and shots[0].get("staging", "").startswith("周宁"),
+          str(shots[0].get("staging") if shots else None))
+    cov = SC.staging_coverage(shots)
+    check("站位覆盖率算得出", cov and cov["filled"] == 1 and cov["n"] == 2, str(cov))
+
+    # 表头驱动：加列不错位（按列数分派的老写法会在这里翻车）
+    tricky = ("| 镜 | 时长 | 景别 | 运镜 | 开场站位 | 画面 | 台词 | 声音 |\n"
+              "|---|---|---|---|---|---|---|---|\n"
+              "| 1 | 3s | 近景 | 固定 | 左 | 周宁｜推门 | 有人吗 | 风铃 |\n")
+    s = SC.parse_shotlist(tricky)
+    check("8 列表头解析不错位",
+          len(s) == 1 and s[0]["visual"] == "周宁｜推门" and s[0]["sound"] == "风铃",
+          str(s[0] if s else None))
+
 
 CASES = [
     ("A 节拍配比", t_beats),
@@ -711,6 +796,7 @@ CASES = [
     ("O 增量重扫接线", t_incremental),
     ("P 故事质量评分卡", t_quality),
     ("Q 命令行接线", t_wiring),
+    ("R 断点续跑与站位", t_progress),
 ]
 
 

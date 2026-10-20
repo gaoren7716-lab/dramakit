@@ -48,7 +48,8 @@ python engine/dramakit.py forms    # 列全部形态与判据差异
 | `dramakit forms` | 列出所有形态与判据差异 |
 | `dramakit spec` | 查看平台 / 后端规格 |
 | `dramakit quality` | 故事质量评分卡：五维结构特征参考分（**不拦稿**） |
-| `dramakit selftest` | 90 项回归断言（16 组用例），秒级，不耗 token |
+| `dramakit progress` | 看项目做到哪一步：哪步做完、产物改没改、下一步干什么 |
+| `dramakit selftest` | 106 项回归断言（17 组用例），秒级，不耗 token |
 
 ## 不能做什么
 
@@ -86,7 +87,65 @@ python engine/dramakit.py check 我的剧/我的剧.md
 
 # 连载项目对账
 python engine/dramakit.py continuity 我的漫剧
+
+# 任何时候想知道"我做到哪了"
+python engine/dramakit.py progress 我的剧
 ```
+
+## 断点续跑：别拿改之前的结论去交付
+
+中间产物会把错误传下去。改完分镜表之后，上一次 `scan` 的结论就作废了——
+但没人记得那是改之前扫的，于是拿着旧结论去交付。
+
+`progress` 用**内容指纹**（sha256，不是 mtime）判断产物有没有变过：
+
+```
+  进度 · 我的剧
+  ────────────────────────────────────────────────────────
+  立项     ✓ 完成  2026-10-20T18:55:40  真人/AI 写实短剧 · single
+  分镜骨架   ✓ 完成  2026-10-20T18:55:40  随立项生成
+  质检     ! 产物已变更：分镜表.md  2026-10-20T18:55:18  2 阻断 / 4 警告
+
+  下一步  分镜表在上次质检后被改过——重扫：dramakit scan <项目>/分镜表.md --record
+```
+
+为什么用指纹不用修改时间：**mtime 会被 checkout、复制、编辑器保存动作改掉**。
+只碰 mtime 不算变更，内容真变了才算。
+
+状态存在 `<项目>/.progress.json`（已 gitignore）。`new` / `skel` 自动记，
+`scan` 要显式加 `--record`——扫描本身是只读动作，不替你做决定。
+
+```bash
+python engine/dramakit.py scan 我的剧/分镜表.md --record
+```
+
+增量重扫（`--changed`）**不记进度**：它只重检被改的镜头，全表比例判据是
+失效的，记成"质检完成"就是撒谎。
+
+## 写盘前先干跑
+
+写盘不可逆，而错往往不是内容错，是**写到了不该写的地方**（同名项目覆盖、路径拼错）。
+
+```bash
+python engine/dramakit.py new 我的剧 "一句话灵感" --dry-run
+```
+
+```
+  将写入 4 个文件，共 6175 字节
+    我的剧\project.json   134 B
+    我的剧\README.md   345 B
+    我的剧\节拍表.md   1074 B
+    我的剧\分镜表.md   4622 B
+
+  干跑：未写盘。确认无误后去掉 --dry-run 再跑一次。
+```
+
+`skel` 默认就是干跑（只打印不写），`--write` 才落盘；`--dry-run` 与
+`--write` 同用时以干跑为准。`new` 遇到已存在的项目默认拒绝，要 `--force`。
+
+**关于"计费双确认"**：这个说法来自需要付费生成的平台。本项目不调模型、
+不产生任何费用，所以"计费"那一半在这里不成立，只吸收"写盘前先干跑"。
+不假装有计费，也不假装确认过。
 
 ## 两个正交的维度：形态 × 档位
 
@@ -155,6 +214,7 @@ python engine/dramakit.py quality 我的剧/我的剧.md
 │       ├── shotlist.py    # 分镜骨架 + 交付校验
 │       ├── scan.py        # 分镜表质检
 │       ├── quality.py     # 故事质量评分卡（五维结构特征）
+│       ├── progress.py    # 断点续跑（.progress.json + 内容指纹）
 │       ├── continuity.py  # 跨集一致性
 │       └── selftest.py    # 回归自检
 ├── config/dramakit.toml   # 唯一常数表，代码里不写死数字
