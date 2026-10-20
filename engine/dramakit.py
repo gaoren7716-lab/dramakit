@@ -183,18 +183,21 @@ def cmd_scan(args):
     const = constants_for(proj, args.mode, form=frm) if proj \
         else constants_for(None, args.mode, form=frm)
     fmt = args.format or "single"
+    # 档位与 is_ai 必须同源：只认 --live-shoot 不看解析出的档位，
+    # 项目里写了 shot_profile = "live" 也会被 AI 后端 8s 上限拦下。
+    mode = str(args.mode or const["drama"].get("shot_profile", "ai"))
+    is_ai = False if args.live_shoot else (mode != "live")
 
     if args.changed:
         changed = parse_changed(args.changed)
         res = SC.analyze_changed(shots, changed, fmt=fmt, text=text, const=const,
-                                 model=args.model, is_ai=not args.live_shoot)
+                                 mode=mode, model=args.model, is_ai=is_ai)
         print(json.dumps(res, ensure_ascii=False, indent=2) if args.json
               else SC.render_changed(res, p.parent.name))
         return 0
 
-    res = SC.analyze(shots, fmt=fmt, text=text, const=const,
-                     platform=args.platform, model=args.model,
-                     is_ai=not args.live_shoot)
+    res = SC.analyze(shots, fmt=fmt, text=text, const=const, mode=mode,
+                     platform=args.platform, model=args.model, is_ai=is_ai)
     print(json.dumps(res, ensure_ascii=False, indent=2) if args.json
           else SC.render(res, p.parent.name, const=const))
     return 0 if not res["blocking"] else 1
@@ -280,6 +283,30 @@ def cmd_spec(args):
     print()
     print(C.dim("  模型能力会升级，投产前必须重新核验——别把它当永久事实。"))
     print()
+    return 0
+
+
+# ------------------------------------------------------------
+# quality（故事质量评分卡）
+# ------------------------------------------------------------
+
+def cmd_quality(args):
+    import quality as QL
+    import scan as SC
+    p = Path(args.path)
+    if not p.exists():
+        raise SystemExit(f"找不到分镜表：{p}")
+    text = p.read_text(encoding="utf-8")
+    shots = SC.parse_shotlist(text)
+    if not shots:
+        raise SystemExit("未解析到任何镜头——检查表头是否为 镜/时长/景别/谁在画面/动作/台词")
+    proj = Path(args.project) if args.project else SC.find_project_root(p)
+    frm = args.form or (_proj_meta(proj).get("form") if proj else None)
+    const = constants_for(proj, args.mode, form=frm) if proj \
+        else constants_for(None, args.mode, form=frm)
+    res = QL.score(shots, text, const["drama"])
+    print(json.dumps(res, ensure_ascii=False, indent=2) if args.json
+          else QL.render(res, p.stem))
     return 0
 
 
@@ -379,6 +406,14 @@ def build_parser():
     s.add_argument("--platform")
     s.add_argument("--model")
     s.set_defaults(fn=cmd_spec)
+
+    s = sub.add_parser("quality", help="故事质量评分卡（结构特征参考分，不拦稿）")
+    s.add_argument("path")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--mode", choices=["ai", "live"])
+    s.add_argument("--form", choices=list(FORMS))
+    s.add_argument("--project", help="显式指定项目根")
+    s.set_defaults(fn=cmd_quality)
 
     sub.add_parser("selftest", help="回归自检").set_defaults(fn=cmd_selftest)
     sub.add_parser("doctor", help="环境自检").set_defaults(fn=cmd_doctor)

@@ -1055,6 +1055,11 @@ def main():
         else constants_for(None, form=opt.get("--form"))
     # 档位：--mode 显式指定 > 项目/全局 [drama] shot_profile > ai
     mode = str(opt.get("--mode") or const["drama"].get("shot_profile", "ai"))
+    # ★ is_ai 必须跟着**解析出来的档位**走，不能只看 --live-shoot 开关。
+    #   踩过的坑：项目 overrides 里写了 shot_profile = "live"，档位判据全切到
+    #   真人长镜，模型上限却仍按 AI 档查——9 秒长镜被"后端 8s 上限"拦下。
+    #   两档判据方向相反，尺子用反比不用尺子更糟。
+    is_ai = False if opt.get("--live-shoot") else (mode != "live")
 
     text = path.read_text(encoding="utf-8")
     shots = parse_shotlist(text)
@@ -1074,14 +1079,15 @@ def main():
                 changed.extend(range(int(m.group(1)), int(m.group(2)) + 1))
             elif part.isdigit():
                 changed.append(int(part))
-        res = analyze_changed(shots, changed, fmt=fmt, text=text, const=const, mode=mode)
+        res = analyze_changed(shots, changed, fmt=fmt, text=text, const=const,
+                              mode=mode, is_ai=is_ai)
         print(json.dumps(res, ensure_ascii=False, indent=2) if opt.get("--json")
               else render_changed(res, path.parent.name))
         return 0
 
     res = analyze(shots, fmt=fmt, text=text, const=const, mode=mode,
                   platform=opt.get("--platform"), model=opt.get("--model"),
-                  is_ai=not opt.get("--live-shoot"))
+                  is_ai=is_ai)
     print(json.dumps(res, ensure_ascii=False, indent=2) if opt.get("--json")
           else render(res, path.parent.name, const=const))
     return 0 if not res["blocking"] else 1

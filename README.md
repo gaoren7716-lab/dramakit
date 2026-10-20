@@ -47,13 +47,16 @@ python engine/dramakit.py forms    # 列全部形态与判据差异
 | `dramakit continuity` | 跨集一致性对账（连载专用）：时间轴 / 角色 / 场景 / 伏笔 |
 | `dramakit forms` | 列出所有形态与判据差异 |
 | `dramakit spec` | 查看平台 / 后端规格 |
-| `dramakit selftest` | 75 项回归断言（14 组用例），秒级，不耗 token |
+| `dramakit quality` | 故事质量评分卡：五维结构特征参考分（**不拦稿**） |
+| `dramakit selftest` | 90 项回归断言（16 组用例），秒级，不耗 token |
 
 ## 不能做什么
 
 - 不生成台词、不生成画面、不抽提示词
 - 不管图生视频、TTS、剪辑——这些交外部工具
 - 不判断"这个题材行不行"——**题材不行，剧本怎么改都是白改**，那是人的判断
+- `quality` 不给"好不好看"下结论。它量的是**结构特征齐不齐**，参考分，不拦稿；
+  演技、共情、审美都量不出来，别把它当审稿人
 
 ## 快速开始
 
@@ -108,6 +111,32 @@ python engine/dramakit.py scan 我的剧/分镜表.md --mode live
 
 或在项目 `config/overrides.toml` 里写 `shot_profile = "live"`，之后自动生效。
 
+## 故事质量评分卡（参考分，不拦稿）
+
+`scan` 量镜头语言，量不到"本子有没有戏"。`quality` 补这一维，量五件事：
+**事情在发生**（事件密度）、**埋的钉子有人捡**（呼应结构）、**空间在换**、
+**不靠旁白点题**、**有人可冲突**。
+
+```bash
+python engine/dramakit.py quality 我的剧/我的剧.md
+```
+
+```
+  总分 92   强  （满分 100；≥80 强，<60 回炉）
+  事件密度      25/25  ████████████████████
+  呼应结构      25/25  ████████████████████
+  空间变化      20/20  ████████████████████
+  点题自律      15/15  ████████████████████
+  冲突面        7/15  █████████░░░░░░░░░░░
+```
+
+**先把话说在前面**：戏好不好最终不可机械判。这里全是代理指标——
+爆款短剧反复出现的结构特征。100 分不代表好看，只代表该有的特征都有。
+
+判据细节、四类伪回声的排除规则、已知盲区，见
+[`references/quality-rubric.md`](references/quality-rubric.md)。
+尺子用 `_test/quality_corpus.json` 的语料证伪：好稿 ≥80、差稿 ≤55、区间不许重叠。
+
 ## 判据在哪
 
 全部在 `config/dramakit.toml`。代码里没有硬编码阈值——改一个数，全套判据跟着变。
@@ -125,13 +154,16 @@ python engine/dramakit.py scan 我的剧/分镜表.md --mode live
 │       ├── plan.py        # 节拍与分集表
 │       ├── shotlist.py    # 分镜骨架 + 交付校验
 │       ├── scan.py        # 分镜表质检
+│       ├── quality.py     # 故事质量评分卡（五维结构特征）
 │       ├── continuity.py  # 跨集一致性
 │       └── selftest.py    # 回归自检
 ├── config/dramakit.toml   # 唯一常数表，代码里不写死数字
-├── references/            # 结构 / 镜头 / 形态 / 规格 / 交付 五份规范
+├── references/            # 结构 / 镜头 / 形态 / 规格 / 交付 / 质量 六份规范
 ├── projects/              # 一个项目一个目录
 │   └── 示例-十七楼/        # 9 镜 61 秒，可直接跑
 └── _test/
+    ├── quality_corpus.json  # 质量评分卡的证伪语料（好稿/差稿 + 区间）
+    └── quality/             # 语料样本本身
 ```
 
 ## 版权

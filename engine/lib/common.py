@@ -53,7 +53,7 @@ FORM_ALIAS = {"comic": "motion_comic", "live": "live_action", "ai": "live_action
 # 形态专属要替换的表。live_action 没有专属块，直接用全局基线。
 # panel 是"格"（漫剧/静态漫独有），asset 是资产台账（动画/漫画独有），
 # hook 是秒级锚点表（各形态爆破节奏不同，容差要跟着变）。
-FORM_TABLES = ("shot", "single", "quality", "panel", "asset", "hook")
+FORM_TABLES = ("shot", "single", "quality", "panel", "asset", "hook", "story")
 
 # 哪些形态有"格"（一组格完成一个起承转合）——只有两种漫。
 # 动漫短剧是连续动画，用影视景别与视频交付，不算"格"形态。
@@ -115,7 +115,7 @@ def apply_form_profile(const: dict, form: str = "live_action",
     # 2) 档位微调：只认 live.* 里按表名分组的差异项
     if prof == "live":
         live = d.get("live") or {}
-        lp = {t: live[t] for t in ("shot", "single", "quality", "hook")
+        lp = {t: live[t] for t in ("shot", "single", "quality", "hook", "story")
               if isinstance(live.get(t), dict) and live[t]}
         if lp:
             d = deep_merge(d, lp)

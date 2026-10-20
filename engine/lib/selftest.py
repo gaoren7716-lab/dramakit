@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import plan as PL           # noqa: E402
+import quality as QL        # noqa: E402
 import scan as SC           # noqa: E402
 import shotlist as SL       # noqa: E402
 from common import CONST, C, constants_for  # noqa: E402
@@ -579,6 +580,119 @@ def t_incremental():
           str([i["check"] for i in live["local"]["blocking"]]))
 
 
+def _dim(res: dict, name: str) -> dict:
+    for x in res["dims"]:
+        if x["name"] == name:
+            return x
+    raise KeyError(name)
+
+
+def t_quality():
+    """故事质量评分卡：先被语料证伪，再逐条验判据能红。
+
+    只跑"好稿高分"是假保护——判据写成"永远满分"也能过。所以两条腿：
+      1. **语料证伪**：_test/quality_corpus.json 里好稿 ≥min、差稿 ≤max，
+         且两组区间不许重叠（重叠说明尺子分不开好坏，等于没尺子）；
+      2. **定向证伪**：逐维注入/抽走特征，确认分数真的会动。
+    """
+    root = Path(__file__).resolve().parents[2]
+    manifest = json.loads((root / "_test" / "quality_corpus.json")
+                          .read_text(encoding="utf-8"))
+
+    goods, bads = [], []
+    for s in manifest["samples"]:
+        p = root / s["path"]
+        text = p.read_text(encoding="utf-8")
+        shots = SC.parse_shotlist(text)
+        const = constants_for(None, "ai", form=s.get("form"))
+        res = QL.score(shots, text, const["drama"])
+        lo, hi = s.get("min"), s.get("max")
+        ok = (lo is None or res["score"] >= lo) and (hi is None or res["score"] <= hi)
+        check(f"语料落在区间 · {p.stem}", ok,
+              f"得 {res['score']}，要求 [{lo if lo is not None else '-inf'}, "
+              f"{hi if hi is not None else '+inf'}]")
+        (goods if lo is not None else bads).append(res["score"])
+    if goods and bads:
+        check("好稿与差稿不重叠", min(goods) > max(bads),
+              f"好稿最低 {min(goods)} 必须 > 差稿最高 {max(bads)}")
+
+    # —— 定向证伪 1：抽掉全部事件词，事件密度必须归零 ——
+    rows = ["| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |",
+            "|---|---|---|---|---|---|"]
+    rows += [f"| {i} | 5s | 中景 | 甲、乙 | 两人相对 | 嗯 |" for i in range(1, 9)]
+    flat = SC.parse_shotlist("\n".join(rows))
+    ev = _dim(QL.score(flat, "", CONST["drama"]), "事件密度")
+    check("无事件词的剧本事件密度为 0", ev["score"] == 0, f"得 {ev['score']}")
+
+    # —— 定向证伪 2：给同样的镜头塞事件词，事件密度必须动 ——
+    rows2 = [r.replace("两人相对", "他推开门走进来") for r in rows]
+    hit = SC.parse_shotlist("\n".join(rows2))
+    ev2 = _dim(QL.score(hit, "", CONST["drama"]), "事件密度")
+    check("有事件词则事件密度上升", ev2["score"] > 0, f"得 {ev2['score']}")
+
+    # —— 定向证伪 3：同源切片必须合并（收银台/收银/银台 只算一处）——
+    rows3 = ["| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |",
+             "|---|---|---|---|---|---|"]
+    for i in range(1, 11):
+        if i in (1, 10):
+            rows3.append(f"| {i} | 5s | 中景 | 周宁 | 收银台 | 今天 |")
+        else:
+            rows3.append(f"| {i} | 5s | 中景 | 周宁 | 站着 | 嗯 |")
+    shots3 = SC.parse_shotlist("\n".join(rows3))
+    ec = _dim(QL.score(shots3, "", CONST["drama"]), "呼应结构")
+    fam = [h for h in ec["hits"] if h[0] in ("收银台", "收银", "银台")]
+    check("同源切片只算一处呼应", len(fam) == 1, f"命中 {fam}")
+    check("主角名不算呼应",
+          all(h[0] != "周宁" for h in ec["hits"]), f"命中 {ec['hits']}")
+
+    # —— 定向证伪 4：旁白 + 主题句必须扣分 ——
+    rows4 = [r.replace("| 嗯 |", "| （旁白）后来才明白，这就是生活 |") for r in rows]
+    pt = _dim(QL.score(SC.parse_shotlist("\n".join(rows4)), "", CONST["drama"]),
+              "点题自律")
+    check("旁白点题扣分", pt["score"] < pt["max"], f"得 {pt['score']}/{pt['max']}")
+
+
+def t_wiring():
+    """命令行接线：档位解析必须一路贯到 is_ai。
+
+    踩过的坑：`dramakit scan` 与 `scan.py main` 是两条独立入口，
+    项目 overrides 里写了 shot_profile = "live"，档位判据切到了真人长镜，
+    模型上限却仍按 AI 档查——9 秒长镜被"后端 8s 上限"拦下。
+    ★ 两条入口都要测：只测其中一条，另一条坏了照样全绿。
+    """
+    import subprocess
+    root = Path(__file__).resolve().parents[2]
+    demo = root / "projects" / "示例-十七楼" / "十七楼.md"
+    cli = root / "engine" / "dramakit.py"
+    if not demo.exists():
+        check("示例-十七楼 存在", False, str(demo))
+        return
+
+    def run(*extra):
+        return subprocess.run([sys.executable, str(cli), "scan", str(demo), *extra],
+                              capture_output=True, text=True, encoding="utf-8",
+                              cwd=str(root))
+
+    # 项目写的是 live：9s 长镜不该被 AI 后端上限拦
+    r = run()
+    check("真人项目不被模型上限误拦",
+          "单镜超模型时长上限" not in r.stdout, r.stdout[-300:])
+    check("真人项目 scan 退出码为 0", r.returncode == 0,
+          f"exit={r.returncode} {r.stdout[-200:]}")
+
+    # 显式 --mode ai：同一份稿子必须被拦，证明判据没被关掉
+    r2 = run("--mode", "ai")
+    check("显式 AI 档仍拦超长镜",
+          "单镜超模型时长上限" in r2.stdout, r2.stdout[-300:])
+
+    # scan.py 的 main 是第二条入口，单独验一遍
+    r3 = subprocess.run([sys.executable, str(root / "engine" / "lib" / "scan.py"),
+                         str(demo)], capture_output=True, text=True,
+                        encoding="utf-8", cwd=str(root))
+    check("scan.py 直调也不误拦",
+          "单镜超模型时长上限" not in r3.stdout, r3.stdout[-300:])
+
+
 CASES = [
     ("A 节拍配比", t_beats),
     ("B 分镜骨架", t_skeleton),
@@ -595,6 +709,8 @@ CASES = [
     ("M 跨集一致性", t_continuity),
     ("N 漫画交付格式", t_delivery_comic),
     ("O 增量重扫接线", t_incremental),
+    ("P 故事质量评分卡", t_quality),
+    ("Q 命令行接线", t_wiring),
 ]
 
 
