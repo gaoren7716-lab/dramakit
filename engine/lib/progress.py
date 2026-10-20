@@ -119,7 +119,8 @@ def status(proj: Path) -> list[dict]:
         else:
             # 没记录：文件在就当"旧项目"，不在就当"没做"
             present = [n for n in defaults if (proj / n).exists()]
-            row["state"] = (_UNRECORDED.get(key, "未记录") if present else "未做")
+            row["state"] = (_UNRECORDED.get(key, "未记录") if present
+                            else f"未做（缺 {'/'.join(defaults[:1])}）")
         rows.append(row)
     return rows
 
@@ -155,11 +156,11 @@ def render(rows: list[dict], name: str, hint: str) -> str:
             tag = C.err("! 产物缺失")
         else:
             tag = C.err("! " + st)
-        # 非"完成/未做"的状态要把原因写出来——只显示一个 "!" 等于没说。
-        # "未记录"类的标签已经把那句话说完了，不再重复一遍。
+        # 标签没把话说全的，把补充信息补在后面——只显示一个 "!" 等于没说。
+        # 有括号就只补括号里的部分，避免"未记录 ? 未记录（…）"这种重复。
         tail = ""
-        if st != "完成" and not st.startswith(("未做", "未记录", "还没扫过")):
-            tail = C.dim("  " + st)
+        if st != "完成" and st != "还没扫过":
+            tail = C.dim("  " + (st[st.index("（"):] if "（" in st else st))
         when = f"  {r['at']}" if r["at"] else ""
         note = C.dim(f"  {r['note']}") if r["note"] else ""
         out.append(f"  {r['label']:<6} {tag}{C.dim(when)}{note}{tail}")
