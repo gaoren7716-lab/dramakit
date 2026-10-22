@@ -16,7 +16,7 @@ import re
 from pathlib import Path
 
 from common import (CONST, C, apply_form_profile, compliance_for, constants_for,
-                    normalize_form, platform_for)
+                    normalize_form, platform_for, sizes_for)
 from plan import ACTS, beats
 
 # 交付定稿的五块
@@ -43,6 +43,16 @@ VISUAL_HINT = "（待填：谁｜动作）"
 PANEL_FORMS = ("motion_comic", "static_comic")
 
 SIZES = ("大特写", "特写", "近景", "中景", "中全景", "全景", "远景")
+
+# 「谁在画面」列里不是人名的写法。对账人物表时先剔掉这些，
+# 否则"空镜""两人"会被当成两个没登记的角色，误报会立刻把这条判据废掉。
+# ★ 与 quality.WHO_NOT_A_NAME 同族纪律：宁可漏，不可吵。
+WHO_STOP = {
+    "空镜", "空镜头", "无人", "无人景", "画外", "旁人", "路人", "众人",
+    "两人", "三人", "四人", "五人", "多人", "两人同框", "三人同框",
+    "二人", "大家", "所有人", "群像", "男", "女", "男声", "女声",
+    "画外音", "字幕", "待填", "画面", "同框", "背影", "手部", "局部",
+}
 
 
 def delivery_columns(const: dict | None = None, form: str | None = None) -> list:
@@ -157,16 +167,133 @@ def to_csv(rows: list[dict]) -> str:
 # 交付校验
 # ------------------------------------------------------------
 
+def _check_body(text: str, header: list[str], const: dict | None = None,
+                form: str | None = None) -> list[str]:
+    """核对分镜表**表体**（表头下面的数据行）。
+
+    查四样，都是机械可判的：
+      1. **有没有数据行**——只有表头没有镜头，是空壳。
+      2. **镜号是否连续**——1,2,4 会让"第 3 镜"在拍摄现场凭空消失。
+      3. **时长是否合法**——"abc" "0s" 这种值说明表没填完或填错了。
+      4. **景别是否在册**——写错景别，模型抽出来的提示词就是错的。
+
+    ★ 为什么必须查：交付校验是**发出去之前的最后一道**。
+      初版只查表头不看行，实测"镜 1 | 999s | 荒谬景别 | 鬼"照样判
+      "格式完整，可以发"——表头对就等于稿子对，这是最坏的假绿。
+    """
+    problems = []
+    if not header:
+        return problems
+
+    # 定位表头行，取它下面的表格行
+    lines = text.splitlines()
+    hidx = None
+    for i, ln in enumerate(lines):
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")] if ln.strip().startswith("|") else []
+        if cells and cells[0] in ("镜", "镜号") and "时长" in cells:
+            hidx = i
+            break
+    if hidx is None:
+        return problems
+
+    rows = []
+    for ln in lines[hidx + 1:]:
+        s = ln.strip()
+        if not s.startswith("|"):
+            if rows:
+                break           # 表体结束
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+            continue             # 分隔行
+        rows.append(cells)
+
+    if not rows:
+        problems.append("分镜表没有数据行（只有表头，不是定稿）")
+        return problems
+
+    # 镜号连续
+    nos = []
+    for cells in rows:
+        if cells and cells[0].isdigit():
+            nos.append(int(cells[0]))
+    if not nos:
+        problems.append("分镜表没有可识别的镜号")
+        return problems
+    if nos != list(range(nos[0], nos[0] + len(nos))):
+        missing = [n for n in range(nos[0], nos[0] + len(nos)) if n not in set(nos)]
+        problems.append(f"镜号不连续（缺 {'、'.join(str(x) for x in missing[:8])}）")
+
+    # 时长合法：**下界与上界都要查**。
+    # ★ 只查"是否为正数"是半个判据——"999s" 是正数，一行就能毁掉全片时长。
+    #   上界取形态的 sec_max（AI 档 8s / 真人 10s / 漫剧 6s…），
+    #   因为超上限的镜头在生成端根本出不来。
+    ti = 1 if len(header) > 1 else -1
+    if ti >= 0:
+        d_ = (const or CONST)["drama"]
+        try:
+            hard = float((d_.get("shot") or {}).get("sec_max") or 0)
+        except (TypeError, ValueError):
+            hard = 0.0
+        bad, over = [], []
+        for cells in rows:
+            if len(cells) <= ti:
+                continue
+            v = cells[ti].strip()
+            m = re.search(r"(\d+(?:\.\d+)?)", v)
+            if not m or float(m.group(1)) <= 0:
+                bad.append(f"镜{cells[0]}({v or '空'})")
+            elif hard and float(m.group(1)) > hard:
+                over.append(f"镜{cells[0]}({float(m.group(1)):g}s)")
+        if bad:
+            problems.append(f"时长不是正数：{'、'.join(bad[:6])}")
+        if over:
+            problems.append(f"时长超过单镜上限 {hard:g}s：{'、'.join(over[:6])}"
+                            f"（超了生成端出不来）")
+
+    # 景别在册：写错景别，模型抽出来的提示词就是错的
+    if "景别" in header:
+        si = header.index("景别")
+        allowed = sizes_for(const, form)
+        bad_sz = []
+        for cells in rows:
+            if len(cells) <= si:
+                continue
+            v = cells[si].strip()
+            if v and v not in allowed:
+                bad_sz.append(f"镜{cells[0]}({v})")
+        if bad_sz:
+            problems.append(f"景别不在白名单：{'、'.join(bad_sz[:6])}（可用：{'、'.join(allowed)}）")
+
+    # 画面/台词列不能整列是占位符（没填的骨架不能当定稿发出去）
+    for label in ("动作一句话", "画面一句话"):
+        if label not in header:
+            continue
+        ci = header.index(label)
+        empty = [c[0] for c in rows
+                 if len(c) > ci and c[ci].strip() in ("（待填）", "（待填：谁｜动作）", "")]
+        if empty and len(empty) == len(rows):
+            problems.append(f"「{label}」整列没填（还是骨架，不是定稿）")
+        elif empty:
+            problems.append(f"「{label}」有 {len(empty)} 镜没填（{'、'.join(empty[:6])}）")
+    return problems
+
+
 def check_delivery(text: str, const: dict | None = None,
                    form: str | None = None, is_ai: bool = True) -> dict:
     """检查定稿是否满足交付格式。
 
-    查四样：五块标题齐不齐、分镜表六列表头对不对、验收额度有没有落数、
-    AIGC 标识在不在（AI 生成内容必查）。这四样是"发出去之前"的最后一道，
+    查六样：五块标题齐不齐、分镜表六列表头对不对、**分镜表本身有没有内容**、
+    镜号连不连续、验收额度有没有落数、AIGC 标识在不在（AI 生成内容必查）。
     缺一样就别发。
 
     列头分两套：视频交付（动作一句话 / 台词原文）与漫画交付（画面一句话 /
     气泡对白）。**按形态取，不是二选一**——写错列头等于交错了东西。
+
+    ★ 表体必须查。初版只查表头不看行，于是"999 秒 / 荒谬景别 / 鬼"这种
+      行照样判"格式完整，可以发"——**表头对就等于稿子对**，这是最坏的假绿：
+      交付校验是发出去之前的最后一道，它说"可以发"就是真的一锤定音。
+      所以这里至少要核：有没有数据行、镜号是否连续、时长是否合法、景别是否在册。
     """
     const = const or CONST
     d = const["drama"]
@@ -193,6 +320,9 @@ def check_delivery(text: str, const: dict | None = None,
             break
     got = [c.strip() for c in head.strip("|").split("|")] if head else []
     bad_cols = [c for c in cols if c not in got]
+
+    # ★ 表体核对：数据行、镜号连续、时长合法
+    body_problems = _check_body(text, got, {"drama": d}, frm)
 
     # 验收额度必须落在"每镜几次 + 失败怎么办"这两件事上。
     # 用词分两种：AI 生成叫"重抽"，真人实拍叫"拍几条"，两种都认。
@@ -222,6 +352,34 @@ def check_delivery(text: str, const: dict | None = None,
         if not (body.count("|") >= 2 or len(re.findall(r"^\*\*", body, re.M)) >= 1):
             asset_missing = True
 
+    # ★ 跨镜可追溯（consistency_check）：分镜表里出场的人，必须在人物表登记过。
+    #   语义是"这四类跨镜必须可追溯"，其中**角色**是唯一能从交付稿机械对账的一类
+    #   （服装/道具/表情没有对应列，见下方 asset_unverifiable）。
+    #   ⚠️ 这条能查是靠"人物表 + 谁在画面"两处文本交集，不做语义理解；
+    #   所以只报"出场了但没登记"，不报"登记了但没出场"（后者可能是有意留白）。
+    unregistered = []
+    cc = asset_block.get("consistency_check") or []
+    if "角色" in cc and got and "谁在画面" in got:
+        reg_block = re.search(
+            r"^#+\s*(?:[一二三四五六七八九十]+\s*[、.．]\s*)?人物表\s*$(.*?)(?=^#|\Z)",
+            text, re.M | re.S)
+        reg = reg_block.group(1) if reg_block else ""
+        used = set()
+        for line in text.splitlines():
+            if not line.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) != len(got) or cells[0] in ("镜", "---") or set(cells[0]) <= {"-"}:
+                continue
+            who = cells[got.index("谁在画面")]
+            for name in re.split(r"[、,，/／+＋和与\s]+", who):
+                name = name.strip("（）()【】[]")
+                if len(name) >= 2 and name not in WHO_STOP and not re.fullmatch(r"[\d.]+s?", name):
+                    used.add(name)
+        for name in sorted(used):
+            if name not in reg:
+                unregistered.append(name)
+
     problems = []
     if missing:
         problems.append(f"缺块：{'、'.join(missing)}")
@@ -229,17 +387,26 @@ def check_delivery(text: str, const: dict | None = None,
         problems.append("找不到分镜表表头")
     elif bad_cols:
         problems.append(f"列头缺：{'、'.join(bad_cols)}")
+    problems += body_problems
     if not quota:
         problems.append("缺验收额度（每镜最多重抽几次 / 失败是停还是继续）")
     if aigc_missing:
         problems.append(f"缺 AIGC 标识（{comp.get('aigc_label_text')}）")
     if asset_missing:
         problems.append("场景未按台账登记（有『格』的形态必须有场景表，防跨镜漂移）")
+    if unregistered:
+        problems.append(f"分镜表出场但人物表未登记：{'、'.join(unregistered)}")
 
     # 附带提醒：交付只该有一个 .md，不该夹带提示词或参考图说明
     extras = []
     if re.search(r"提示词|prompt|风格后缀", text, re.I):
         extras.append("正文里出现提示词或风格后缀字样——交付只放定稿")
+    # 有声明却无数据源的资产项：明确说出来，不静默当通过
+    nv = [k for k in ("expression_enum", "costume_enum_required", "char_views")
+          if asset_block.get(k)]
+    if nv:
+        extras.append("资产项 " + "、".join(nv)
+                      + " 在交付稿里没有对应列，本工具查不到——需人工核对")
 
     return {"ok": not problems, "problems": problems, "warnings": extras,
             "blocks": len(BLOCKS) - len(missing), "columns": len(cols) - len(bad_cols),

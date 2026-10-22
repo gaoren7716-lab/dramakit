@@ -53,7 +53,8 @@ FORM_ALIAS = {"comic": "motion_comic", "live": "live_action", "ai": "live_action
 # 形态专属要替换的表。live_action 没有专属块，直接用全局基线。
 # panel 是"格"（漫剧/静态漫独有），asset 是资产台账（动画/漫画独有），
 # hook 是秒级锚点表（各形态爆破节奏不同，容差要跟着变）。
-FORM_TABLES = ("shot", "single", "quality", "panel", "asset", "hook", "story", "work")
+FORM_TABLES = ("shot", "single", "quality", "panel", "asset", "hook", "story",
+               "work")
 
 # 哪些形态有"格"（一组格完成一个起承转合）——只有两种漫。
 # 动漫短剧是连续动画，用影视景别与视频交付，不算"格"形态。
@@ -209,6 +210,26 @@ def compliance_for(const: dict | None = None) -> dict:
         "forbidden_terms": [],
     }
     return deep_merge(base, d.get("compliance") or {})
+
+
+def sizes_for(const: dict | None = None, form: str | None = None) -> tuple:
+    """取本形态的景别白名单。
+
+    ★ 视频形态原先**没有白名单**，于是"荒谬景别"这种值能一路通过
+      scan 与 check 发出去。景别是有限枚举不是自由文本——写错景别，
+      模型抽出来的提示词就是错的，而且没人知道错在哪。
+      漫剧用格名，白名单在各自的 [panel].sizes 里；这里只管视频形态。
+    """
+    d = (const or CONST)["drama"]
+    frm = normalize_form(form or d.get("form") or "live_action")
+    panel = d.get("panel") or {}
+    if frm in PANEL_FORMS and panel.get("sizes"):
+        return tuple(panel["sizes"])
+    tbl = d.get("sizes") or {}
+    spec = deep_merge(tbl.get("default") or {}, tbl.get(frm) or {})
+    sizes = spec.get("sizes") or []
+    return tuple(sizes) if sizes else ("大特写", "特写", "近景", "中景",
+                                       "中全景", "全景", "远景")
 
 
 def find_project_root(path, levels: int = 4):

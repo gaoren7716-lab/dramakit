@@ -31,6 +31,27 @@ ST_ = (CONST.get("drama") or {}).get("story") or {}
 # 谁在画面列的占位符：解析前先剔掉，否则"（待填）"会被当成一个人物
 WHO_PLACEHOLDERS = {"", "无", "待填", "（待填）", "—", "-", "略"}
 
+# ★ 不是人名、但写在"谁在画面"列里的东西。数它们会把人物数虚增，
+#   冲突面因此虚高——这正是"按名词查表"翻车的老坑。
+#   "空镜"是没有人的镜头；"两人"是数量描述不是名字；"三人同框"同理。
+WHO_NOT_A_NAME = {
+    "空镜", "空镜头", "无人", "无人景", "画外", "旁人", "路人", "众人",
+    "两人", "三人", "四人", "五人", "多人", "两人同框", "三人同框",
+    "二人", "大家", "所有人", "众人同框", "群像",
+    "男", "女", "男声", "女声", "画外音", "字幕",
+}
+
+
+def _is_real_name(w: str) -> bool:
+    """这个"谁在画面"格子里写的是不是一个人名。"""
+    if not w or w in WHO_PLACEHOLDERS or w in WHO_NOT_A_NAME:
+        return False
+    # "两人"这类数量词：含"人/众/位/名"且前面是数字 → 数量描述
+    if re.fullmatch(r"[0-9一二三四五六七八九十两几多]+[人众位名]", w):
+        return False
+    return True
+
+
 # 子句切分：token 只在子句内滑窗产出，跨子句不组词。
 # ★ ｜ 必须在册——交付格式的 visual 是"谁｜动作"，不切它就会产出
 #   "周宁｜车"这种缝合怪 token，呼应数直接虚胖。
@@ -71,6 +92,12 @@ def _who_names(s: dict) -> set:
 
     7 列工作表没有"谁在画面"列，返回空集且不可验——调用方必须注明，
     不许把"画面里没人名"当成"只有一个角色"。
+
+    ★ 必须剔掉占位与数量描述（"空镜""两人""三人同框"）。
+      剔不掉的后果：一个人物的镜头会被数成三四个人，冲突面的人物分
+      直接虚高——实测《十七楼》明明只有周牧与女人两人，却报"4 个人物"，
+      拿满 15/15。这跟"胶水词混进呼应"是同一族病：查到了词，
+      但那个词不是这个维度要的东西。
     """
     visual = s.get("visual") or ""
     if "｜" not in visual:
@@ -78,7 +105,7 @@ def _who_names(s: dict) -> set:
     who = visual.split("｜", 1)[0]
     for sep in ("、", "，", ",", "/", "和", "与"):
         who = who.replace(sep, " ")
-    return {w for w in who.split() if w and w not in WHO_PLACEHOLDERS}
+    return {w for w in who.split() if _is_real_name(w)}
 
 
 # ------------------------------------------------------------
@@ -232,21 +259,39 @@ def dim_echoes(shots: list[dict], st: dict) -> dict:
 
 
 def dim_places(shots: list[dict], text: str, st: dict) -> dict:
-    """空间变化：场景一直在换，戏才往前走。一个客厅说完全场是棚拍广播剧。"""
+    """空间变化：场景一直在换，戏才往前走。一个客厅说完全场是棚拍广播剧。
+
+    ★ 只从**镜头列**（画面/台词）取场景名，不扫正文。
+      初版扫全文，于是正文"场景：客厅、卧室、厨房"这种清单就能拿满分——
+      实测一张 8 镜全在客厅的表，正文列三个场景名，空间变化直接 20/20。
+      这就是"按名词查表"的又一次翻车：查到了词，却不是这个维度要的东西。
+      空间变化量的是"这一镜发生在哪儿"，所以必须逐镜看。
+    """
     pl = _tbl(st, "places")
     words = _words(pl)
     w = int(st.get("w_places") or 20)
-    found = _hits(text, words) | _hits(" ".join(s.get("visual") or "" for s in shots), words)
-    # 同源合并：词表里"收银台"与"收银"会同时命中同一场戏——一个地方算两处。
-    # 被别的命中词包含的短词直接丢弃（保留最具体的那个）。
-    found = {x for x in found if not any(x != y and x in y for y in found)}
+    # 逐镜取该镜出现的场景词 —— 命中才算"这一镜在这个空间"
+    per_shot = []
+    for s in shots:
+        t = _shot_text(s)
+        hit = _hits(t, words)
+        # 同源合并：词表里"收银台"与"收银"会同时命中同一场戏——一个地方算两处。
+        # 被别的命中词包含的短词直接丢弃（保留最具体的那个）。
+        hit = {x for x in hit if not any(x != y and x in y for y in hit)}
+        if hit:
+            per_shot.append(sorted(hit))
+    found = set()
+    for h in per_shot:
+        found |= set(h)
     n = len(found)
     full = int(pl.get("full_count") or 3)
     sc = w if n >= full else (w / 2 if n == full - 1 else 0.0)
+    detail = f"{n} 处场景（满配 {full} 处）：" + (
+        "、".join(sorted(found)[:8]) if found else "未识别")
+    if not found:
+        detail += "｜分镜表里没写出场景名，戏可能一直在一个地方"
     return {"name": "空间变化", "score": round(sc, 1), "max": w,
-            "detail": f"{n} 处场景（满配 {full} 处）："
-                      + ("、".join(sorted(found)[:8]) if found else "未识别"),
-            "hits": sorted(found)[:8]}
+            "detail": detail, "hits": sorted(found)[:8]}
 
 
 def dim_pointing(shots: list[dict], st: dict) -> dict:

@@ -22,7 +22,8 @@ from collections import Counter
 from pathlib import Path
 
 from common import (CONST, C, apply_form_profile, bar, compliance_for,
-                    constants_for, model_for, normalize_form, platform_for)
+                    constants_for, model_for, normalize_form, platform_for,
+                    sizes_for)
 
 D_ = CONST["drama"]
 DS_ = D_["single"]
@@ -268,7 +269,18 @@ def parse_acts(text: str) -> list[dict]:
 
 
 def has_line(s: dict) -> bool:
-    """该镜是否有台词。'无' 与 '—（字幕/画面文字）' 都不算。"""
+    """该镜是否有**台词**。
+
+    排除两种占位：
+      - "无"           = 这一镜没有台词
+      - "—" / "—（…）" = 没有台词（破折号后跟的是画面文字说明，不是台词）
+
+    ★ "—（画面文字：电梯停在十七楼）"这类**不是台词但有内容**——
+      它要算 has_content（长镜不空），但不算 has_line（有台词）。
+      这两件事分开判：初版 has_content 只判 `t != "无"`，于是单独的"—"
+      也被当成有内容，**长镜空镜判据整条失效且不报错**（实测：12 个 6 秒
+      长镜全填"—"，一个都没报空镜）。这是本项目最典型的病——判据静默失灵。
+    """
     t = (s.get("line") or "").strip()
     if not t or t == "无":
         return False
@@ -278,17 +290,32 @@ def has_line(s: dict) -> bool:
 
 
 def has_content(s: dict) -> bool:
-    """该镜是否承载内容（台词 / 字幕 / 旁白 / 画面文字）。长镜不得是纯空镜。"""
+    """该镜是否承载内容（台词 / 字幕 / 旁白 / 画面文字）。长镜不得是纯空镜。
+
+    "—（画面文字：…）"算有内容——它是画面上钉住的信息，正是长镜该干的事。
+    单独的"—"不算——那等于什么都没说。
+    """
     t = (s.get("line") or "").strip()
-    return bool(t) and t != "无"
+    if not t or t == "无":
+        return False
+    if t.startswith("—") or t.startswith("-"):
+        # 破折号后跟了实质说明（画面文字/字幕）→ 有内容
+        rest = t.lstrip("—-").strip()
+        return bool(rest) and rest not in ("（）", "()")
+    return True
 
 
-def is_hook(s: dict, close_sizes: tuple = CLOSE_SIZES) -> bool:
+def is_hook(s: dict, close_sizes: tuple = CLOSE_SIZES,
+             long_take_sec: float | None = None) -> bool:
     """启发式钩子信号：情绪运镜 / 情绪特写 / 冲突台词 / 突发事件 / 信息密集长镜。
 
     ★ `close_sizes` 必须按形态传入。写死"特写/大特写"会让漫剧的"特写格/大格"
     一个都认不出——**漫剧形态下钩子判据会整体失效，表现为所有窗口都"断档"**
     （实测：《便利店》24 格全判无钩子）。
+
+    ★ `long_take_sec` 同理，必须按形态/档位传入。写死全局值（5s）会让
+      漫剧的 4s 长镜（漫剧 long_take_sec=4）判不出钩子信号——**形态差异
+      只在配置里生效，判据里却看不到，等于那半张表是空转的**。
     """
     if any(m in (s["move"] or "") for m in HOOK_MOVES):
         return True
@@ -298,7 +325,8 @@ def is_hook(s: dict, close_sizes: tuple = CLOSE_SIZES) -> bool:
         return True
     if any(w in (s.get("visual") or "") for w in HOOK_VISUAL):
         return True
-    if s["sec"] >= DSHOT_["long_take_sec"]:
+    lt = DSHOT_["long_take_sec"] if long_take_sec is None else long_take_sec
+    if s["sec"] >= lt:
         return True
     return False
 
@@ -317,7 +345,8 @@ def has_ending_hook(s: dict) -> bool:
 
 
 def hook_windows(shots: list[dict], window_s: int,
-                 close_sizes: tuple = CLOSE_SIZES) -> list[dict]:
+                 close_sizes: tuple = CLOSE_SIZES,
+                 long_take_sec: float | None = None) -> list[dict]:
     """按累计时长切窗口，返回每个窗口及其是否含钩子。"""
     wins, cur, t0, acc = [], [], 0.0, 0.0
     for s in shots:
@@ -326,13 +355,13 @@ def hook_windows(shots: list[dict], window_s: int,
         if acc >= window_s:
             wins.append({"t0": round(t0, 1), "t1": round(t0 + acc, 1),
                          "shots": cur,
-                         "hook": any(is_hook(x, close_sizes) for x in cur)})
+                         "hook": any(is_hook(x, close_sizes, long_take_sec) for x in cur)})
             t0 += acc
             acc, cur = 0.0, []
     if cur:
         wins.append({"t0": round(t0, 1), "t1": round(t0 + acc, 1),
                      "shots": cur,
-                     "hook": any(is_hook(x, close_sizes) for x in cur)})
+                     "hook": any(is_hook(x, close_sizes, long_take_sec) for x in cur)})
     return wins
 
 
@@ -363,6 +392,9 @@ def hook_anchor_checks(shots: list[dict], d: dict,
     超出总时长的锚点**自动忽略**——60 秒的片子不查 180s 锚点，
     为够不着的秒数误报是把尺子用反。
 
+    ★ 长镜阈值取**形态/档位解析后的值**：漫剧 long_take_sec=4，
+      写死全局 5s 会让漫剧的 4s 长镜判不出钩子信号，形态差异形同虚设。
+
     返回 (未命中锚点列表, 全部锚点明细)。anchor_required = false 时直接放行。
     """
     h = d.get("hook") or {}
@@ -372,12 +404,14 @@ def hook_anchor_checks(shots: list[dict], d: dict,
     if not anchors:
         return [], []
     gap = float(h.get("anchor_gap_s") or 15)
+    long_take = float((d.get("shot") or {}).get("long_take_sec")
+                      or DSHOT_["long_take_sec"])
 
     total = sum(s["sec"] for s in shots)
     ends, acc = [], 0.0
     for s in shots:
         acc += s["sec"]
-        if is_hook(s, close_sizes):
+        if is_hook(s, close_sizes, long_take):
             ends.append(round(acc, 2))
 
     detail, miss = [], []
@@ -385,7 +419,7 @@ def hook_anchor_checks(shots: list[dict], d: dict,
         if a > total + 1e-9:
             continue                      # 够不着的锚点不查
         if a == 0:
-            ok = bool(shots) and is_hook(shots[0], close_sizes)
+            ok = bool(shots) and is_hook(shots[0], close_sizes, long_take)
             last = 0.0 if ok else None
         else:
             last = max((e for e in ends if e <= a + 1e-9), default=None)
@@ -404,13 +438,19 @@ def is_comic(d: dict) -> bool:
 def comic_panel_checks(shots: list[dict], d: dict) -> tuple[list, list, dict]:
     """漫剧 / 静态漫专属判据。视频形态一律返回空——这些检查对视频短剧毫无意义。
 
-    五类，全部确定性可算：
+    六类，全部确定性可算：
       1. **气泡对白字数**：超上限就是装不下，物理问题不是风格问题
       2. **景别 / 运镜白名单**：写影视景别（近景/中景）模型会抽错提示词，
          漫画只有"格"
       3. **静态漫不许有运镜**：写了推拉就是形态写错了，出片时执行不了
       4. **格组起承转合**：一组格子数越界说明节拍粒度失控
       5. **参考图配额**：单格引用的参考图超过配额，说明在自由发挥，脸会漂
+      6. **近景占比**：大格/中格/特写格得占多数，否则读不清脸
+
+    ★ 第 6 项踩过"按名词查表"的坑（v0.6.0 修正）：同一个语义在两种形态下
+      叫不同名字——视频形态（在 `[*.quality]`）叫 `close_medium_ratio_min`，
+      漫画形态（在 `[*.panel]`）叫 `close_ratio_min`。代码只认了视频那个名字，
+      漫画的阈值从定下来就没人读。**别假设同一个概念只有一个名字。**
 
     第 5 项依赖分镜表里有「参考图」列；交付表（6 列）没有这列，
     所以只在工作格式（7 列）下可查，缺列时明确记 `asset_unverifiable`
@@ -474,6 +514,26 @@ def comic_panel_checks(shots: list[dict], d: dict) -> tuple[list, list, dict]:
     info["grids"] = n
     info["bubble_cap"] = cap
     info["reading_order"] = panel.get("reading_order", "")
+
+    # 6. **漫画近景占比**：漫画要"读得清"，大格/中格/特写格得占多数。
+    #    ★ 这里踩过"按名词查表"的坑：同一个语义（近景占比下限）在两种形态下
+    #    叫不同名字——视频形态叫 close_medium_ratio_min（在 [*.quality]），
+    #    漫画形态叫 close_ratio_min（在 [*.panel]）。代码只认了视频那个名字，
+    #    于是漫画的阈值从定下来就没人读。
+    #    景别集合也照形态取：漫画用"格"，不能用影视景别算。
+    crm = panel.get("close_ratio_min")
+    if crm and shots:
+        cs = set(panel.get("close_sizes") or CLOSE_SIZES)
+        nclose = sum(1 for s in shots if s["size"] in cs)
+        ratio = nclose / len(shots)
+        info["close_ratio"] = round(ratio, 3)
+        info["close_ratio_min"] = float(crm)
+        if ratio < float(crm):
+            warning.append({
+                "check": "漫画近景占比不足",
+                "value": f"{ratio * 100:.0f}%（{nclose}/{len(shots)} 格）",
+                "limit": f"≥ {float(crm) * 100:.0f}%，否则读不清脸",
+            })
 
     # 参考图配额：只有工作格式（带 prompt_en 列）才查得到
     quota = asset.get("ref_per_panel_max") or asset.get("ref_per_shot_max")
@@ -727,6 +787,7 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
     core_ratio = len(core) / n
 
     blocking, warning = [], []
+    cliff_info = None
 
     # 黄金窗口：镜 1 不得超长，且不得用旁白交代
     first = shots[0]
@@ -738,7 +799,12 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
                          "value": first["line"][:24], "limit": "用画面/物件钉处境"})
 
     # 长镜必须承载内容（台词 / 字幕 / 旁白），不得是纯空镜
-    bad_long = [s for s in long_take if not has_content(s)]
+    # ★ 排除末镜：末镜是余味镜，按定义就是"不解释、不总结，只留一个动作
+    #   或一个物件的变化"——**没有台词是它的正常形态**。跟反应镜判据
+    #   排除末镜是同一个道理：末镜由结尾规则（余味镜 ≥long_take_sec）
+    #   单独管，不能再叠一条"必须有台词"。
+    last_no = shots[-1]["no"]
+    bad_long = [s for s in long_take if not has_content(s) and s["no"] != last_no]
     if bad_long:
         blocking.append({"check": "长镜空镜",
                          "value": "镜 " + "/".join(str(s["no"]) for s in bad_long),
@@ -765,6 +831,18 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
         if not has_ending_hook(last):
             blocking.append({"check": "连载结尾无钩子", "value": f"镜 {last['no']}",
                              "limit": "最后一镜必须留悬念"})
+        # ★ 连载才查卡点评分：单集完结没有"付不付费"这回事。
+        #   [cliff] 这张表此前整张空转（项目里 grep 不到 cliff），
+        #   现在接上：结尾镜的卡点强度必须够。
+        import cliff as CF
+        cres = CF.score_ending(shots, d, rxsizes)
+        cliff_info = cres
+        if not cres["ok"]:
+            warning.append({
+                "check": "卡点评分不足",
+                "value": f"{cres['score']:.0f} 分（{cres['detail']}）",
+                "limit": f"付费集结尾卡点 ≥ {cres['min']} 分",
+            })
 
     # 镜头语言
     if fixed_ratio < dq["fixed_ratio_min"]:
@@ -789,7 +867,8 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
                         "limit": f"特写无台词镜 ≤ {dshot['reaction_max_sec']:g}s"})
 
     # 钩子密度（景别按形态取，否则漫剧全判断档）
-    wins = hook_windows(shots, dq["hook_per_seconds"], rxsizes)
+    wins = hook_windows(shots, dq["hook_per_seconds"], rxsizes,
+                         dshot["long_take_sec"])
     miss = [w for w in wins if not w["hook"]]
     if miss:
         spans = "、".join(f"{w['t0']:.0f}-{w['t1']:.0f}s" for w in miss)
@@ -820,6 +899,31 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
     cblock, cwarn, cinfo = comic_panel_checks(shots, d)
     blocking += cblock
     warning += cwarn
+
+    # 景别白名单：视频形态的景别是有限枚举，写错模型抽错提示词。
+    # 漫剧的白名单在 comic_panel_checks 里查（它用 [panel].sizes），
+    # 这里只管视频形态——两处各用各的表，不共用一套名词。
+    if not is_comic(d):
+        allowed = sizes_for({"drama": d}, d.get("form"))
+        bad_size = [s for s in shots if s["size"] and s["size"] not in allowed]
+        if bad_size:
+            blocking.append({
+                "check": "景别不在白名单",
+                "value": "镜 " + "/".join(f"{s['no']}({s['size']})" for s in bad_size[:8]),
+                "limit": "、".join(allowed),
+            })
+
+    # 单镜太短：sec_min 定了却没人查，等于空转。
+    # 0.5 秒的镜在成片里是一帧闪——观众看不清，也接不上戏。
+    sec_min = float(dshot.get("sec_min") or 0)
+    if sec_min > 0:
+        too_short = [s for s in shots if 0 < s["sec"] < sec_min]
+        if too_short:
+            warning.append({
+                "check": "单镜过短",
+                "value": "镜 " + "/".join(f"{s['no']}({s['sec']:g}s)" for s in too_short[:8]),
+                "limit": f"单镜 ≥ {sec_min:g}s（太短看不清，也接不上）",
+            })
 
     # 合规（AIGC 标识 / 未成年人 / 违规敏感）
     kblock, kwarn, kinfo = compliance_checks(text, shots, d, frm, is_ai=is_ai)
@@ -855,6 +959,7 @@ def analyze(shots: list[dict], fmt: str = "single", text: str = "",
         "windows": wins, "hook_miss": len(miss),
         "act_check": act_check, "act_drift": act_drift,
         "staging": staging_coverage(shots),
+        "cliff": cliff_info,
         "comic": cinfo, "compliance": kinfo, "model": minfo, "platform": pinfo,
         "blocking": blocking, "warning": warning,
         "baseline": {
@@ -907,12 +1012,15 @@ def analyze_changed(shots: list[dict], changed: list[int], fmt: str = "single",
     local_blocking, local_warning, touched = [], [], []
 
     # 1) 被改镜头本身：长镜空镜（镜头局部）
+    #    ★ 末镜豁免，理由同全量路径：末镜是余味镜，没台词是它的正常形态。
+    last_no = shots[-1]["no"] if shots else None
     for no in sorted(changed_set):
         s = by_no.get(no)
         if not s:
             continue
         touched.append(no)
-        if s["sec"] >= dshot["long_take_sec"] and not has_content(s):
+        if (s["sec"] >= dshot["long_take_sec"] and not has_content(s)
+                and no != last_no):
             local_blocking.append({"check": "长镜空镜", "value": f"镜 {no}",
                                    "limit": f"≥{dshot['long_take_sec']}s 必须含台词/字幕"})
         # 2) 特写无台词反应镜偏长（镜头局部）
@@ -956,6 +1064,15 @@ def analyze_changed(shots: list[dict], changed: list[int], fmt: str = "single",
                                          is_ai=is_ai)
     local_blocking += kblock
     local_warning += kwarn
+
+    # 4.6) 漫画形态专属判据：气泡超长 / 景别运镜白名单 / 静态漫出现运镜。
+    #      ★ 这几条**只取决于被改的那一镜**，是镜头局部判据，必须接上——
+    #      实测：改一格的气泡对白到 80 字，全量报"气泡对白超长"（阻断），
+    #      增量路径却一声不吭。漏接的后果比"不检"更坏——用户以为增量扫过了。
+    if changed_shots:
+        cblock, cwarn, _ = comic_panel_checks(changed_shots, d)
+        local_blocking += cblock
+        local_warning += cwarn
 
     # 5) 失效的全表比例判据：按当前形态与档位取真名，改动越多失效面越大
     span = f"{dshot['core_sec_min']:g}-{dshot['core_sec_max']:g}s"
@@ -1060,6 +1177,12 @@ def render(res: dict, title: str = "", const: dict | None = None) -> str:
 
     cinfo = res.get("comic") or {}
     stg = res.get("staging")
+    cres = res.get("cliff")
+    if cres:
+        cc = C.ok if cres.get("ok") else C.warn
+        cscore = "%.0f 分" % cres["score"]
+        out.append("  卡点   " + cc(cscore)
+                   + C.dim("   " + cres["detail"]))
     if stg and stg.get("empty"):
         out.append("  站位   " + C.warn(f"{stg['filled']}/{stg['n']} 已填")
                    + C.dim(f"   未填镜 {'/'.join(str(x) for x in stg['shots'][:8])}"

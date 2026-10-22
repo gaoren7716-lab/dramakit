@@ -11,6 +11,7 @@
     python engine/dramakit.py forms
     python engine/dramakit.py spec [--platform 名] [--model 名]
     python engine/dramakit.py quality 我的剧/我的剧.md
+    python engine/dramakit.py cliff 我的剧/第10集-分镜表.md
     python engine/dramakit.py progress 我的剧
     python engine/dramakit.py selftest
     python engine/dramakit.py doctor
@@ -229,7 +230,11 @@ def cmd_scan(args):
     frm = args.form or (_proj_meta(proj).get("form") if proj else None)
     const = constants_for(proj, args.mode, form=frm) if proj \
         else constants_for(None, args.mode, form=frm)
-    fmt = args.format or "single"
+    # ★ 规模（single/series）必须读 project.json：连载项目按单集判据质检，
+    #   时长/镜数/结尾余味全按错的尺子量（连载压根不查单集时长与镜数，
+    #   结尾镜要求是钩子不是余味长镜）。
+    #   实测：project.json 写 format=series，不带 --format 时恒按 single 走。
+    fmt = args.format or (_proj_meta(proj).get("format") if proj else None) or "single"
     # 档位与 is_ai 必须同源：只认 --live-shoot 不看解析出的档位，
     # 项目里写了 shot_profile = "live" 也会被 AI 后端 8s 上限拦下。
     mode = str(args.mode or const["drama"].get("shot_profile", "ai"))
@@ -249,13 +254,58 @@ def cmd_scan(args):
 
     res = SC.analyze(shots, fmt=fmt, text=text, const=const, mode=mode,
                      platform=args.platform, model=args.model, is_ai=is_ai)
+    # 连载项目：顺手查分集表的节奏（卡点挤堆 / 一直憋 / 付费前不是低谷）。
+    # 分集表与分镜表是两个文件，但节奏问题只有合起来看才露出来。
+    rhythm = None
+    if fmt == "series" and proj:
+        import cliff as CF
+        ep = proj / "分集表.md"
+        if ep.exists():
+            rb, rw, ri = CF.check_series_rhythm(ep.read_text(encoding="utf-8"), const["drama"])
+            rhythm = {"blocking": rb, "warning": rw, "info": ri}
+            res["blocking"].extend(rb)
+            res["warning"].extend(rw)
     print(json.dumps(res, ensure_ascii=False, indent=2) if args.json
           else SC.render(res, p.parent.name, const=const))
+    if rhythm and not args.json:
+        import cliff as CF
+        print(CF.render_rhythm(rhythm["blocking"], rhythm["warning"], rhythm["info"]))
     if args.record and proj:
         import progress as PG
+        # ★ 必须把阻断数记进 result：progress 的状态机靠它区分
+        #   "扫过了"和"扫过了但还有阻断"。不记 → progress 显示"完成"，
+        #   next_step 接着说"三步都齐了"，等于进度文件替人签了字。
         PG.record(proj, "scan", [p],
-                  note=f"{len(res['blocking'])} 阻断 / {len(res['warning'])} 警告")
+                  note=f"{len(res['blocking'])} 阻断 / {len(res['warning'])} 警告",
+                  result={"blocking": len(res["blocking"]),
+                          "warning": len(res["warning"]),
+                          "total": res["total"], "shots": res["n"]})
     return 0 if not res["blocking"] else 1
+
+
+def cmd_cliff(args):
+    """卡点评分：结尾镜值不值得让人掏钱。"""
+    import cliff as CF
+    import scan as SC
+    p = Path(args.path)
+    if not p.exists():
+        raise SystemExit(f"找不到分镜表：{p}")
+    text = p.read_text(encoding="utf-8")
+    shots = SC.parse_shotlist(text)
+    if not shots:
+        raise SystemExit("未解析到任何镜头——检查表头是否为 镜/时长/景别/谁在画面/动作/台词")
+    proj = Path(args.project) if args.project else SC.find_project_root(p)
+    frm = args.form or (_proj_meta(proj).get("form") if proj else None)
+    const = constants_for(proj, args.mode, form=frm) if proj \
+        else constants_for(None, args.mode, form=frm)
+    d = const["drama"]
+    rxsizes = SC.reaction_set(d) if "form" in d else SC.reaction_set(
+        SC.apply_form_profile({"drama": d}, frm or "live_action",
+                               args.mode or "ai")["drama"])
+    res = CF.score_ending(shots, d, rxsizes)
+    print(json.dumps(res, ensure_ascii=False, indent=2) if args.json
+          else CF.render(res, p.stem))
+    return 0 if res["ok"] else 1
 
 
 def cmd_progress(args):
@@ -293,7 +343,11 @@ def cmd_check(args):
 def cmd_continuity(args):
     import continuity as CY
     proj = resolve_project(args.project)
-    res = CY.check(proj)
+    # ★ 必须把合过项目覆盖的 const 传进去：`[continuity]` 的开关写在
+    #   config 里，项目可以用 overrides.toml 改。不传 const 就只能读
+    #   全局默认——**项目级开关静默失效**（同族：is_ai 不看解析出的档位）。
+    const = constants_for(proj, form=(_proj_meta(proj).get("form") if proj else None))
+    res = CY.check(proj, const=const)
     print(json.dumps({k: v for k, v in res.items() if k != "ledger"},
                      ensure_ascii=False, indent=2) if args.json
           else CY.render(res, proj.name))
@@ -494,6 +548,14 @@ def build_parser():
     s.add_argument("project")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_progress)
+
+    s = sub.add_parser("cliff", help="卡点评分：结尾镜值不值得让人掏钱")
+    s.add_argument("path")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--mode", choices=["ai", "live"])
+    s.add_argument("--form", choices=list(FORMS))
+    s.add_argument("--project", help="显式指定项目根")
+    s.set_defaults(fn=cmd_cliff)
 
     sub.add_parser("selftest", help="回归自检").set_defaults(fn=cmd_selftest)
     sub.add_parser("doctor", help="环境自检").set_defaults(fn=cmd_doctor)

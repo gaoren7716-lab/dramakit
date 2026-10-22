@@ -36,6 +36,15 @@ TABLES = {
 }
 
 
+def cf_tl_gap(d: dict | None) -> float:
+    """读 `[continuity].timeline_gap_max_s`。0 = 相邻集必须首尾相接。"""
+    sw = (d or {}).get("continuity") or {}
+    try:
+        return float(sw.get("timeline_gap_max_s") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _rows(md: str, header_kw: str) -> list[dict]:
     """抓某张表的数据行。表头下面第一行是 |---| 分隔，之后每行按表头列数切。
 
@@ -182,10 +191,24 @@ TEMPLATE = """# 跨集台账 · {name}
 # 判据
 # ------------------------------------------------------------
 
-def check(proj, ledger: dict | None = None) -> dict:
-    """跑全部跨集一致性判据，返回 {blocking, warning, info, counts}。"""
+def check(proj, ledger: dict | None = None, const: dict | None = None) -> dict:
+    """跑全部跨集一致性判据，返回 {blocking, warning, info, counts}。
+
+    ★ 每个判据都受 config [continuity] 的开关控制。
+      早先那 7 个开关一个都没被读——表看起来在管事，实际全是空转。
+      空转的开关比没有开关更坏：它让人以为"这条有人管"。
+      现在：关掉某个开关，对应的判据就不查。
+    """
     led = ledger or load_ledger(proj)
     blocking, warning, info = [], [], {}
+
+    # 开关从 config 取；没给 const 时用全局默认（全开）
+    d = (const or {}).get("drama") if const else None
+    if d is None:
+        from common import CONST
+        d = CONST["drama"]
+    sw = d.get("continuity") or {}
+    on = lambda k: bool(sw.get(k, True))    # noqa: E731
 
     if not led.get("exists"):
         return {"blocking": [{"check": "缺跨集台账",
@@ -199,13 +222,14 @@ def check(proj, ledger: dict | None = None) -> dict:
     threads = led["threads"]
     info["counts"] = {"时间轴": len(tl), "角色": len(chars),
                       "场景": len(scenes), "伏笔": len(threads)}
+    info["switches"] = {k: on(k) for k in sw} if sw else {}
 
     # ---- T 时间轴 ----
     eps = []
     for r in tl:
         v = r.get("集") or r.get("集号") or ""
         eps.extend(_span_episodes(v))
-    if eps:
+    if on("require_timeline") and eps:
         seen = sorted(set(eps))
         gaps = [n for n in range(seen[0], seen[-1] + 1) if n not in set(seen)]
         if gaps:
@@ -224,39 +248,65 @@ def check(proj, ledger: dict | None = None) -> dict:
             note = tl[i].get("说明", "") + tl[i].get("备注", "")
             if "并行" not in note:
                 dup.append(f"{pts[i - 1][0]}↔{pts[i][0]}({pts[i][1]})")
-    if dup:
+    if on("require_timeline") and dup:
         warning.append({
             "check": "相邻集时点重复",
             "value": "、".join(dup),
             "limit": "两集同一时刻须在说明里标『并行』，否则是时间轴写重了",
         })
 
+    # T3：相邻集时间轴空档（`timeline_gap_max_s`）
+    # ★ 这个键此前是空转的（config 写了、代码没读）。它需要台账里的「止」列
+    #   才能算跨度，而「止」在续集样本里是有的——所以它是**可接的**，不是
+    #   "无数据源"那一类。默认 0 = 必须首尾相接。
+    #   时点写成"第1天 上午"这种自然语言，秒数无法直接换算，
+    #   所以这里的判定口径是：**相邻集的时点字符串必须相接**——
+    #   前集的「止」要等于后集的「起」；不等就是空档。差多少秒由人判断，
+    #   机器只报"这里断了"。
+    gap_max = float(cf_tl_gap(d))
+    if on("require_timeline") and gap_max == 0:
+        gaps_t = []
+        for i in range(1, len(tl)):
+            prev_stop = (tl[i - 1].get("止") or tl[i - 1].get("结束") or "").strip()
+            cur_start = (tl[i].get("起") or tl[i].get("时点") or "").strip()
+            if prev_stop and cur_start and prev_stop != cur_start:
+                gaps_t.append(f"{tl[i - 1].get('集', '?')}→{tl[i].get('集', '?')}"
+                              f"（止「{prev_stop}」≠ 起「{cur_start}」）")
+        if gaps_t:
+            warning.append({
+                "check": "时间轴有断口",
+                "value": "；".join(gaps_t[:6]),
+                "limit": "timeline_gap_max_s = 0 要求相邻集首尾相接，"
+                         "否则中间那段空白没人写（要么补，要么改阈值）",
+            })
+
     # ---- C 角色 ----
     ids = [r.get("ID") or r.get("id") or "" for r in chars]
     ids = [i for i in ids if i]
     dupid = sorted({i for i in ids if ids.count(i) > 1})
-    if dupid:
+    if on("character_id_required") and dupid:
         blocking.append({"check": "角色 ID 重复", "value": "、".join(dupid),
                          "limit": "ID 必须唯一，否则跨集引用会指向两个角色"})
     char_names = {(r.get("姓名") or r.get("名字") or "").strip() for r in chars}
     char_names.discard("")
 
     # C3 换装声明：服装列若出现多段（写了不止一个集区间），必须含"换"字说明
-    for r in chars:
-        costume = (r.get("服装") or "").strip()
-        ranges = re.findall(r"\d+\s*[-~]\s*\d+", costume)
-        if len(ranges) >= 2 and "换" not in costume:
-            warning.append({
-                "check": "换装未声明",
-                "value": f"{r.get('姓名') or r.get('ID')}：{costume[:30]}",
-                "limit": "同一角色有多个服装段时必须写明第几集换装",
-            })
+    if on("costume_change_must_declare"):
+        for r in chars:
+            costume = (r.get("服装") or "").strip()
+            ranges = re.findall(r"\d+\s*[-~]\s*\d+", costume)
+            if len(ranges) >= 2 and "换" not in costume:
+                warning.append({
+                    "check": "换装未声明",
+                    "value": f"{r.get('姓名') or r.get('ID')}：{costume[:30]}",
+                    "limit": "同一角色有多个服装段时必须写明第几集换装",
+                })
 
     # ---- S 场景 ----
     sids = [r.get("ID") or r.get("id") or "" for r in scenes]
     sids = [i for i in sids if i]
     sdup = sorted({i for i in sids if sids.count(i) > 1})
-    if sdup:
+    if on("scene_reuse_tracked") and sdup:
         blocking.append({"check": "场景 ID 重复", "value": "、".join(sdup),
                          "limit": "ID 必须唯一"})
 
@@ -268,13 +318,14 @@ def check(proj, ledger: dict | None = None) -> dict:
         bury = _span_episodes(r.get("埋点集") or r.get("埋") or "")
         reap = _span_episodes(r.get("回收集") or r.get("回收") or "")
         state = (r.get("状态") or "").strip()
-        if bury and reap and max(bury) >= min(reap):
+        if on("foreshadow_double_bind") and bury and reap and max(bury) >= min(reap):
             blocking.append({
                 "check": "伏笔埋点晚于回收点",
                 "value": f"{fid}：埋 {bury} / 收 {reap}",
                 "limit": "先埋再收；反了等于时间倒流",
             })
-        if reap and state in ("未回收", "active", "未激活") and "规划" not in state:
+        if (on("foreshadow_double_bind") and reap
+                and state in ("未回收", "active", "未激活") and "规划" not in state):
             warning.append({
                 "check": "伏笔状态与回收点矛盾",
                 "value": f"{fid}：回收集 {reap} 已填，状态却写「{state}」",
@@ -292,25 +343,27 @@ def check(proj, ledger: dict | None = None) -> dict:
         known = set(eps_files and [n for n, _ in eps_files])
         # X1 伏笔回收集必须真实存在（在台账集号里）
         all_eps = seen if eps else sorted(known)
-        for r in threads:
-            for ep in _span_episodes(r.get("回收集") or ""):
-                if all_eps and ep not in set(all_eps):
-                    warning.append({
-                        "check": "伏笔回收集不存在",
-                        "value": f"{r.get('ID')}：回收集 {ep}",
-                        "limit": f"台账里的集号只有 {min(all_eps)}-{max(all_eps)}",
-                    })
+        if on("dangling_ref_forbidden"):
+            for r in threads:
+                for ep in _span_episodes(r.get("回收集") or ""):
+                    if all_eps and ep not in set(all_eps):
+                        warning.append({
+                            "check": "伏笔回收集不存在",
+                            "value": f"{r.get('ID')}：回收集 {ep}",
+                            "limit": f"台账里的集号只有 {min(all_eps)}-{max(all_eps)}",
+                        })
         # C2 每集分镜表出场角色是否都已登记
-        for n, f in eps_files:
-            text = f.read_text(encoding="utf-8")
-            for nm in _shotshot_names(text):
-                # 允许"人物表"里出现的别名：只要台账某条姓名包含或等于
-                if not any(nm == cn or nm in cn or cn in nm for cn in char_names):
-                    warning.append({
-                        "check": "角色未登记",
-                        "value": f"第 {n} 集出现「{nm}」，角色台账无此人",
-                        "limit": "所有出场角色必须在 continuity.md 角色表登记一条",
-                    })
+        if on("character_id_required"):
+            for n, f in eps_files:
+                text = f.read_text(encoding="utf-8")
+                for nm in _shotshot_names(text):
+                    # 允许"人物表"里出现的别名：只要台账某条姓名包含或等于
+                    if not any(nm == cn or nm in cn or cn in nm for cn in char_names):
+                        warning.append({
+                            "check": "角色未登记",
+                            "value": f"第 {n} 集出现「{nm}」，角色台账无此人",
+                            "limit": "所有出场角色必须在 continuity.md 角色表登记一条",
+                        })
 
     return {"blocking": blocking, "warning": warning, "info": info,
             "counts": info.get("counts", {}), "ledger": led}

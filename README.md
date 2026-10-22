@@ -43,13 +43,15 @@ python engine/dramakit.py forms    # 列全部形态与判据差异
 | `dramakit plan` | 按配比算四段时长，或排系列分集表；核对平台时长档 |
 | `dramakit skel` | 按节拍与核心镜长，算出每段该给几镜，排出空表 |
 | `dramakit scan` | 分镜表质检：时长 / 镜数 / 镜头语言 / 钩子密度 / 合规 / 模型上限 |
-| `dramakit check` | 交付格式校验：五块结构、列头、验收额度、AIGC 标识 |
+| `dramakit check` | 交付格式校验：五块结构、列头、**表体**、验收额度、AIGC 标识 |
 | `dramakit continuity` | 跨集一致性对账（连载专用）：时间轴 / 角色 / 场景 / 伏笔 |
 | `dramakit forms` | 列出所有形态与判据差异 |
 | `dramakit spec` | 查看平台 / 后端规格 |
 | `dramakit quality` | 故事质量评分卡：五维结构特征参考分（**不拦稿**） |
 | `dramakit progress` | 看项目做到哪一步：哪步做完、产物改没改、下一步干什么 |
-| `dramakit selftest` | 106 项回归断言（17 组用例），秒级，不耗 token |
+| `dramakit cliff` | 卡点评分：结尾镜值不值得让人掏钱（百分制，可批量比对） |
+| `dramakit selftest` | 150 项回归断言（20 组用例），秒级，不耗 token |
+| `dramakit doctor` | 环境自检：Python 版本 / 配置能不能读 / 目录齐不齐 |
 
 ## 不能做什么
 
@@ -196,6 +198,32 @@ python engine/dramakit.py quality 我的剧/我的剧.md
 [`references/quality-rubric.md`](references/quality-rubric.md)。
 尺子用 `_test/quality_corpus.json` 的语料证伪：好稿 ≥80、差稿 ≤55、区间不许重叠。
 
+## 卡点评分：结尾镜值不值得让人掏钱
+
+连载的生死线不在单集好不好看，在**卡点**。观众看到第 9 集结尾那一秒，
+决定要不要付第 10 集的钱。那一秒是分镜表里的最后一个镜，全部信息都在表里，
+所以**机械可判**。
+
+```bash
+python engine/dramakit.py cliff 我的漫剧/第09集/分镜表.md
+```
+
+```
+  卡点评分 · 第09集
+  ────────────────────────────────────────────────────────
+    87.0 分   强   （门槛 70 分）
+  ████████████████████
+  命中 5/6 加分项（line_hook、visual_event、emotion_close、
+  cliff_question、info_reverse）；87/70 分
+```
+
+四项基础（台词钩子 / 画面事件 / 情绪特写 / 未答问题）、两项高级
+（信息反转 / 伏笔回收）、两项减分（陈述收尾 / 旁白交代）。
+**百分制**——早先阈值按原始加权和写（85），而原始满分只有 56，永远达不到。
+
+连载项目跑 `scan` 时还会顺带查**分集表节奏**：付费集前一集是不是情绪低谷、
+高潮有没有挤堆、有没有连憋太久、情绪净值有没有越界。
+
 ## 判据在哪
 
 全部在 `config/dramakit.toml`。代码里没有硬编码阈值——改一个数，全套判据跟着变。
@@ -211,9 +239,10 @@ python engine/dramakit.py quality 我的剧/我的剧.md
 │   └── lib/
 │       ├── common.py      # 常数加载 / 形态档位解析 / 平台模型规格
 │       ├── plan.py        # 节拍与分集表
-│       ├── shotlist.py    # 分镜骨架 + 交付校验
+│       ├── shotlist.py    # 分镜骨架 + 交付校验（含表体核对）
 │       ├── scan.py        # 分镜表质检
 │       ├── quality.py     # 故事质量评分卡（五维结构特征）
+│       ├── cliff.py       # 卡点评分 + 分集节奏
 │       ├── progress.py    # 断点续跑（.progress.json + 内容指纹）
 │       ├── continuity.py  # 跨集一致性
 │       └── selftest.py    # 回归自检
@@ -223,7 +252,10 @@ python engine/dramakit.py quality 我的剧/我的剧.md
 │   └── 示例-十七楼/        # 9 镜 61 秒，可直接跑
 └── _test/
     ├── quality_corpus.json  # 质量评分卡的证伪语料（好稿/差稿 + 区间）
-    └── quality/             # 语料样本本身
+    ├── quality/             # 语料样本本身
+    ├── audit_config_keys.py # config 键消费审计（查空转）
+    ├── doccheck.py          # 文档对账（幽灵命令 / 数字谎言 / 形态名）
+    └── plagiarism_probe.py  # 查重（长行 ≥40 字 / 中文短句 ≥18 汉字）
 ```
 
 ## 版权

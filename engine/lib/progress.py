@@ -66,19 +66,29 @@ def save(proj: Path, data: dict) -> Path:
     return f
 
 
-def record(proj: Path, stage: str, outputs, note: str = "") -> dict:
-    """记一步做完。outputs 给 Path 列表，存在的才记指纹。"""
+def record(proj: Path, stage: str, outputs, note: str = "",
+           result: dict | None = None) -> dict:
+    """记一步做完。outputs 给 Path 列表，存在的才记指纹。
+
+    `result` 存这次动作的结构化结论（如 {"blocking": 2, "warning": 4}）。
+    为什么要单列一个字段而不塞进 note：note 是给人看的，result 是给
+    状态机看的——"扫过了"和"扫过了但还剩 2 个阻断"是两件事，
+    混在一句文本里就得靠正则去抠，迟早抠错。
+    """
     data = load(proj)
     outs = {}
     for p in outputs:
         p = Path(p)
         if p.exists() and p.is_file():
             outs[p.name] = sha(p)
-    data["stages"][stage] = {
+    entry = {
         "done": datetime.now().isoformat(timespec="seconds"),
         "outputs": outs,
         "note": note,
     }
+    if result:
+        entry["result"] = result
+    data["stages"][stage] = entry
     save(proj, data)
     return data
 
@@ -93,7 +103,14 @@ _UNRECORDED = {
 
 
 def status(proj: Path) -> list[dict]:
-    """逐阶段判状态。四种：完成 / 产物已变更 / 产物缺失 / 未记录 / 未做。"""
+    """逐阶段判状态。六种：完成 / 有阻断 / 产物已变更 / 产物缺失 / 未记录 / 未做。
+
+    ★ "扫过了"不等于"通过了"。质检阶段带阻断时，状态必须是"有阻断"，
+      不能显示"完成"——progress 的全部价值就是告诉人"现在能不能交付"，
+      把带 2 个阻断的结果说成"完成"，等于让进度文件替你签了字。
+      （实测：scan 退出码 1（有阻断），progress 却显示"质检 ✓ 完成"，
+      next_step 接着说"三步都齐了"——这是最坏的一类假绿。）
+    """
     data = load(proj)
     rec = data.get("stages") or {}
     rows = []
@@ -115,7 +132,13 @@ def status(proj: Path) -> list[dict]:
                 elif changed:
                     row["state"] = f"产物已变更：{'、'.join(changed)}"
                 else:
-                    row["state"] = "完成"
+                    # 产物没变，但结论本身还带着阻断 → 不能叫"完成"
+                    res = entry.get("result") or {}
+                    nb = int(res.get("blocking") or 0)
+                    if key == "scan" and nb > 0:
+                        row["state"] = f"有阻断：{nb} 项未解决"
+                    else:
+                        row["state"] = "完成"
         else:
             # 没记录：文件在就当"旧项目"，不在就当"没做"
             present = [n for n in defaults if (proj / n).exists()]
@@ -134,6 +157,10 @@ def next_step(proj: Path, rows: list[dict]) -> str:
         return "dramakit skel <项目> --write"
     if "变更" in by["scan"]:
         return "分镜表在上次质检后被改过——重扫：dramakit scan <项目>/分镜表.md --record"
+    # 有阻断：先修阻断，别急着交付。绝不能走到"三步都齐了"那句——
+    # 那是发给老板的定稿，不是带 2 个阻断的草稿。
+    if by["scan"].startswith("有阻断"):
+        return "质检还有阻断项未解决——先修：dramakit scan <项目>/分镜表.md"
     if by["scan"] != "完成":
         return "dramakit scan <项目>/分镜表.md --record"
     return "三步都齐了：dramakit check <项目>/<项目>.md 校验交付格式"
@@ -146,6 +173,8 @@ def render(rows: list[dict], name: str, hint: str) -> str:
         st = r["state"]
         if st == "完成":
             tag = C.ok("✓ 完成")
+        elif st.startswith("有阻断"):
+            tag = C.err("✗ " + st)
         elif st.startswith("未做") or st == "还没扫过":
             tag = C.dim("· " + (st if st == "还没扫过" else "未做"))
         elif st.startswith("未记录"):
@@ -159,7 +188,7 @@ def render(rows: list[dict], name: str, hint: str) -> str:
         # 标签没把话说全的，把补充信息补在后面——只显示一个 "!" 等于没说。
         # 有括号就只补括号里的部分，避免"未记录 ? 未记录（…）"这种重复。
         tail = ""
-        if st != "完成" and st != "还没扫过":
+        if st != "完成" and st != "还没扫过" and not st.startswith("有阻断"):
             tail = C.dim("  " + (st[st.index("（"):] if "（" in st else st))
         when = f"  {r['at']}" if r["at"] else ""
         note = C.dim(f"  {r['note']}") if r["note"] else ""
@@ -167,7 +196,7 @@ def render(rows: list[dict], name: str, hint: str) -> str:
     out.append("")
     out.append(C.cyan(f"  下一步  {hint}"))
     out.append("")
-    return "\n".join(out)
+    return out and "\n".join(out)
 
 
 def main():

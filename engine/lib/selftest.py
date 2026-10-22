@@ -708,8 +708,8 @@ def t_progress():
     """
     import progress as PG
 
-    with tempfile.TemporaryDirectory() as td:
-        proj = Path(td)
+    with tempfile.TemporaryDirectory() as sandbox:
+        proj = Path(sandbox)
         # 立项文件要在，否则 next_step 会先说"去立项"，测不到重扫那条分支
         (proj / "project.json").write_text("{}", encoding="utf-8")
         f = proj / "分镜表.md"
@@ -737,8 +737,8 @@ def t_progress():
         check("产物缺失要报缺失", "缺失" in rows["scan"], rows["scan"])
 
     # 干跑：写盘函数在 dry 模式下不许碰盘
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td) / "proj"
+    with tempfile.TemporaryDirectory() as sandbox:
+        root = Path(sandbox) / "proj"
         files = {root / "a.md": "aaa", root / "sub" / "b.md": "bbbb"}
         import contextlib
         import io as _io
@@ -778,6 +778,309 @@ def t_progress():
           str(s[0] if s else None))
 
 
+# ------------------------------------------------------------
+# S 判据不静默失效 —— 本组专治"判据存在、能跑、不报错，但量的是错东西"
+# ------------------------------------------------------------
+# 为什么单开一组：**全绿不等于没问题**。历史上两次"107/107 全绿"的开局
+# 里，藏着 is_ai 不看档位、parse_shotlist 按列数分派、长镜空镜判据整条失效
+# 这类真 bug——它们不报错、不崩溃，只是量错。
+#
+# 所以本组的每条都必须满足：**构造必坏的输入，确认它红；恢复，确认它绿。**
+# 只测"正常能过"的用例在这一组一律不要。
+
+def _shots_placeholder(n: int = 4, val: str = "中景", line: str = "—",
+                       sec: str = "3s") -> str:
+    rows = "".join(
+        f"| {i} | {sec} | {val} | 周宁 | 他站着没动 | {line} |\n" for i in range(1, n + 1))
+    return ("| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |\n"
+            "|---|---|---|---|---|---|\n" + rows)
+
+
+def t_no_silent_fail():
+    """每条判据：注入必坏输入 → 必须红；恢复 → 必须绿。"""
+    d = CONST["drama"]
+
+    # 1) has_content：「—」是"无内容"，不是"有内容"。
+    #    旧写法只判 t != "无"，于是整表「—」的长镜空镜判据一条都不报。
+    s_blank = {"no": 1, "line": "—", "sec": 9}
+    check("「—」判定为无内容", not SC.has_content(s_blank))
+    check("「—」判定为无台词", not SC.has_line(s_blank))
+    # 但「—（画面文字：三年后）」是有内容、无台词——两种写法必须分开
+    s_card = {"no": 2, "line": "—（画面文字：三年后）", "sec": 9}
+    check("「—（…）」有内容但无台词",
+          SC.has_content(s_card) and not SC.has_line(s_card))
+    check("正常台词既有内容也有台词",
+          SC.has_content({"no": 3, "line": "你别走"}))
+
+    # 空镜注入 → 必须出现"长镜空镜"阻断；把台词填上 → 必须消失
+    # 时长要真的过 long_take_sec（AI 档 5s），否则测的是别的判据
+    blank = SC.parse_shotlist(_shots_placeholder(4, "中景", "—", sec="7s"))
+    r_blank = SC.analyze(blank, fmt="single", text="", mode="ai")
+    bnames = [b["check"] for b in r_blank["blocking"]]
+    check("注入全空长镜 → 报长镜空镜", "长镜空镜" in bnames, str(bnames))
+    filled = SC.parse_shotlist(_shots_placeholder(4, "中景", "我不走", sec="7s"))
+    r_filled = SC.analyze(filled, fmt="single", text="", mode="ai")
+    check("填上台词 → 不再报长镜空镜",
+          "长镜空镜" not in [b["check"] for b in r_filled["blocking"]],
+          str([b["check"] for b in r_filled["blocking"]]))
+
+    # 2) is_hook 的形态阈值必须真的按形态走。
+    #    旧写法写死模块级 long_take_sec=5，漫剧(4s)/动漫(6s)的阈值全失效。
+    sh = {"no": 1, "sec": 5.0, "size": "中景", "line": "你别走", "move": "固定"}
+    check("真人档 5s 算长镜", SC.is_hook(sh, long_take_sec=5))
+    check("动漫档 5s 不算长镜", not SC.is_hook(sh, long_take_sec=6))
+    check("漫剧档 5s 算长镜", SC.is_hook(sh, long_take_sec=4))
+
+    # 3) 景别白名单：视频形态也必须查（此前 SIZES 定义了但无人引用）
+    bad = SC.parse_shotlist(_shots_placeholder(4, "近景", "我在"))
+    check("正常景别不误报",
+          "景别不在白名单" not in [b["check"] for b in
+                                   SC.analyze(bad, fmt="single", mode="ai")["blocking"]]
+          + [w["check"] for w in
+             SC.analyze(bad, fmt="single", mode="ai")["warning"]])
+    weird = SC.parse_shotlist(_shots_placeholder(4, "超级无敌大特写", "我在"))
+    r_weird = SC.analyze(weird, fmt="single", mode="ai")
+    check("荒谬景别 → 报不在白名单",
+          "景别不在白名单" in [b["check"] for b in r_weird["blocking"]],
+          str([b["check"] for b in r_weird["blocking"]]))
+
+    # 4) sec_min：单镜过短必须警告
+    short = ("| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |\n"
+             "|---|---|---|---|---|---|\n"
+             "| 1 | 1s | 中景 | 周宁 | 他站着 | 我来了 |\n"
+             "| 2 | 3s | 中景 | 周宁 | 他走了 | 你走 |\n")
+    r_short = SC.analyze(SC.parse_shotlist(short), fmt="single", mode="ai")
+    check("单镜过短 → 警告",
+          "单镜过短" in [w["check"] for w in r_short["warning"]],
+          str([w["check"] for w in r_short["warning"]]))
+
+    # 5) 漫画 close_ratio_min 必须真被执行（旧版：同一个语义两种名字，只认了视频那个）
+    from common import constants_for
+    cm = constants_for(None, "ai", form="motion_comic")["drama"]
+    panel = cm.get("panel") or {}
+    check("漫画形态确有 close_ratio_min", bool(panel.get("close_ratio_min")),
+          str(panel.get("close_ratio_min")))
+    # 全用"远景格"→ 近景占比 0 → 必须报警
+    far = ("| 镜 | 时长 | 景别 | 运镜 | 谁在画面 | 画面一句话 | 气泡对白 |\n"
+           "|---|---|---|---|---|---|---|\n"
+           + "".join(f"| {i} | 2.5s | 远景格 | 固定 | 周宁 | 他站着 | — |\n"
+                     for i in range(1, 5)))
+    r_far = SC.analyze(SC.parse_shotlist(far), fmt="single", mode="ai",
+                       form="motion_comic")
+    check("漫画全远景 → 报近景占比不足",
+          "漫画近景占比不足" in [w["check"] for w in r_far["warning"]],
+          str([w["check"] for w in r_far["warning"]]))
+    near = far.replace("远景格", "中格")
+    r_near = SC.analyze(SC.parse_shotlist(near), fmt="single", mode="ai",
+                        form="motion_comic")
+    check("漫画中格为主 → 不报近景占比",
+          "漫画近景占比不足" not in [w["check"] for w in r_near["warning"]],
+          str([w["check"] for w in r_near["warning"]]))
+
+    # 6) quality 空间变化必须逐镜取，不能扫全文。
+    #    旧写法：正文里写三个场景名就满分（假阳性）。
+    q_shot_md = ("| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |\n"
+                 "|---|---|---|---|---|---|\n"
+                 "| 1 | 3s | 中景 | 周宁 | 他在办公室 | 我在 |\n"
+                 "| 2 | 3s | 中景 | 周宁 | 他还在办公室 | 你走 |\n"
+                 "| 3 | 3s | 中景 | 周宁 | 他仍在办公室 | 别走 |\n")
+    qbody = ("## 场景\n\n办公室。\n\n周宁在办公室，林晚在厨房，母亲在阳台。\n"
+             "（正文里提了办公室、厨房、阳台三个地名，但镜头只有一个空间）\n")
+    shots_q = SC.parse_shotlist(q_shot_md)
+    dp = QL.dim_places(shots_q, qbody, QL.ST_)
+    check("空间变化按镜算，正文地名不算数", dp["score"] < dp["max"],
+          f"{dp['score']}/{dp['max']} {dp.get('detail', '')}")
+
+    # 7) quality 人物数必须剔占位（"空镜""两人"不是人名）
+    fake = ("| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |\n"
+            "|---|---|---|---|---|---|\n"
+            "| 1 | 3s | 中景 | 周宁｜他站着 | 他站着 | 我在 |\n"
+            "| 2 | 3s | 中景 | 空镜｜房间空了 | 房间空了 | — |\n"
+            "| 3 | 3s | 中景 | 两人｜他们站着 | 他们站着 | 你走 |\n")
+    nm = set()
+    for _s in SC.parse_shotlist(fake):
+        nm |= QL._who_names(_s)
+    check("占位不当人名（空镜/两人不计数）", nm == {"周宁"}, str(nm))
+
+    # 8) 交付表体必须查：表头对 ≠ 稿子对
+    good = _delivery_ok()
+    ok_res = SL.check_delivery(good, CONST, form="live_action", is_ai=True)
+    check("正常交付稿不误报", ok_res["ok"], str(ok_res["problems"]))
+    # 注入三样：镜号跳号、时长非正、景别不在白名单。
+    # 样本只有 1 镜，所以先补到 3 镜再破坏，才能测"连续性"。
+    two = good.replace(
+        "| 1 | 6s | 中景 | 林晚 | 站在门口 | 我下周三来 |\n",
+        "| 1 | 6s | 中景 | 林晚 | 站在门口 | 我下周三来 |\n"
+        "| 2 | 5s | 近景 | 林晚 | 她坐下 | 你瘦了 |\n"
+        "| 3 | 4s | 中景 | 林晚 | 她起身 | 我走了 |\n", 1)
+    check("样本补到 3 镜可测连续性",
+          len([l for l in two.splitlines() if l.startswith("| 2 |")]) == 1)
+    ok2 = SL.check_delivery(two, CONST, form="live_action", is_ai=True)
+    check("3 镜正常稿仍不误报", ok2["ok"], str(ok2["problems"]))
+
+    evil = two.replace("| 2 | 5s | 近景 |", "| 22 | 999s | 超级景 |", 1)
+    check("注入确实改到了表体", evil != two)
+    el_res = SL.check_delivery(evil, CONST, form="live_action", is_ai=True)
+    check("表体坏 → 拦住", bool(el_res["problems"]), str(el_res["problems"]))
+    check("报出镜号问题", any("镜号" in p for p in el_res["problems"]),
+          str(el_res["problems"]))
+    check("报出时长问题", any("时长" in p for p in el_res["problems"]),
+          str(el_res["problems"]))
+    check("报出景别问题", any("景别" in p for p in el_res["problems"]),
+          str(el_res["problems"]))
+
+    # 人物表对账：分镜表出场了却没登记 → 必须报
+    unreg = two.replace("| 3 | 4s | 中景 | 林晚 | 她起身 | 我走了 |",
+                        "| 3 | 4s | 中景 | 张三 | 他起身 | 我走了 |", 1)
+    check("注入未登记人物确实改到了", unreg != two)
+    ur_res = SL.check_delivery(unreg, CONST, form="live_action", is_ai=True)
+    check("未登记人物 → 报",
+          any("未登记" in p and "张三" in p for p in ur_res["problems"]),
+          str(ur_res["problems"]))
+    check("已登记人物不误报",
+          not any("未登记" in p for p in SL.check_delivery(
+              two, CONST, form="live_action", is_ai=True)["problems"]),
+          str(SL.check_delivery(two, CONST, form="live_action", is_ai=True)["problems"]))
+    # 占位词不能当没登记的人名（"空镜""两人"）
+    ph = two.replace("| 3 | 4s | 中景 | 林晚 | 她起身 | 我走了 |",
+                     "| 3 | 4s | 中景 | 空镜 | 房间空了 | — |", 1)
+    check("占位不当未登记人物",
+          not any("未登记" in p for p in
+                  SL.check_delivery(ph, CONST, form="live_action", is_ai=True)["problems"]),
+          str(SL.check_delivery(ph, CONST, form="live_action", is_ai=True)["problems"]))
+
+    # 9) cliff 评分：口径必须百分制，强卡点能到 100、弱卡点不合格
+    import cliff as CF
+    strong = SC.parse_shotlist(
+        "| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |\n"
+        "|---|---|---|---|---|---|\n"
+        "| 1 | 3s | 中景 | 周宁 | 他递过照片 | 这是三年前的 |\n"
+        "| 2 | 3s | 特写 | 周宁 | 照片上的人是她 | 原来是你？ |\n")
+    r_strong = CF.score_ending(strong, CONST["drama"])
+    check("强卡点拿满分", r_strong["score"] >= 90 and r_strong["ok"],
+          f"{r_strong['score']} {r_strong['detail']}")
+    weak = SC.parse_shotlist(
+        "| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |\n"
+        "|---|---|---|---|---|---|\n"
+        "| 1 | 3s | 中景 | 周宁 | 他坐着 | 我在 |\n"
+        "| 2 | 3s | 中景 | 周宁 | 他站起来走了 | 明天见。 |\n")
+    r_weak = CF.score_ending(weak, CONST["drama"])
+    check("弱卡点判不合格", not r_weak["ok"] and r_weak["band"] == "不合格",
+          f"{r_weak['score']} {r_weak['band']}")
+
+    # 10) 分集节奏四条规则：注入必坏输入 → 必须报
+    pay_bad = ("## 分集表\n\n| 集 | 时长 | 情绪净值 | 单元线 | 主线推进 | 结尾钩子 | 标记 |\n"
+               "|---|---|---|---|---|---|---|\n"
+               "| 1 | 90s | 5 | a | b | c | 免费区 |\n"
+               "| 2 | 90s | 4 | a | b | c | 免费区 |\n"
+               "| 3 | 90s | 3 | a | b | c | ★ 付费卡点 |\n"
+               "| 4 | 90s | -2 | a | b | c | 小高潮 |\n"
+               "| 5 | 90s | -1 | a | b | c | 小高潮 |\n")
+    rb, rw, ri = CF.check_series_rhythm(pay_bad, CONST["drama"])
+    names = [w["check"] for w in rw]
+    check("付费前不是低谷 → 报", "付费卡点前不是情绪低谷" in names, str(names))
+    check("高潮挤堆 → 报", "高潮挤堆" in names, str(names))
+    check("连续压抑 → 报", "连续压抑过久" in names, str(names))
+    # 越界必须阻断
+    oob = pay_bad.replace("| 4 | 90s | -2 |", "| 4 | 90s | -99 |")
+    rb2, _, _ = CF.check_series_rhythm(oob, CONST["drama"])
+    check("情绪净值越界 → 阻断",
+          "情绪净值越界" in [b["check"] for b in rb2], str([b["check"] for b in rb2]))
+    # 健康的表：不报
+    good_ep = ("## 分集表\n\n| 集 | 时长 | 情绪净值 | 单元线 | 主线推进 | 结尾钩子 | 标记 |\n"
+               "|---|---|---|---|---|---|---|\n"
+               "| 1 | 90s | 2 | a | b | c | 免费区 |\n"
+               "| 2 | 90s | -5 | a | b | c | 免费区 |\n"
+               "| 3 | 90s | 3 | a | b | c | ★ 付费卡点 |\n"
+               "| 4 | 90s | 1 | a | b | c |  |\n"
+               "| 5 | 90s | 2 | a | b | c |  |\n"
+               "| 6 | 90s | 3 | a | b | c | 小高潮 |\n")
+    rb3, rw3, _ = CF.check_series_rhythm(good_ep, CONST["drama"])
+    check("健康分集表不误报", not rb3 and not rw3, str([w["check"] for w in rw3]))
+
+    # 11) continuity 开关：关掉即不查（旧版 7 个开关全是空转）
+    import continuity as CY
+    const_off = json.loads(json.dumps(CONST))
+    const_off["drama"]["continuity"] = {
+        "require_timeline": False, "character_id_required": True,
+        "scene_reuse_tracked": True, "costume_change_must_declare": True,
+        "foreshadow_double_bind": True, "dangling_ref_forbidden": True,
+    }
+    with tempfile.TemporaryDirectory() as sandbox:
+        p = Path(sandbox) / "proj"
+        p.mkdir()
+        (p / "continuity.md").write_text(
+            "## 时间轴\n\n| 集 | 起 | 止 | 说明 |\n|---|---|---|---|\n"
+            "| 1 | 第一天 | 第二天 |  |\n| 3 | 第五天 | 第六天 |  |\n",
+            encoding="utf-8")
+        r_on = CY.check(p, const=CONST)
+        r_off = CY.check(p, const=const_off)
+        on_b = [b["check"] for b in r_on["blocking"]]
+        off_b = [b["check"] for b in r_off["blocking"]]
+        check("时间轴跳号：开关开 → 报", "时间轴跳号" in on_b, str(on_b))
+        check("时间轴跳号：开关关 → 不报", "时间轴跳号" not in off_b, str(off_b))
+        check("开关状态被记录", r_off["info"].get("switches", {}).get("require_timeline") is False,
+              str(r_off["info"].get("switches")))
+
+        # 时间轴断口（timeline_gap_max_s = 0 要求首尾相接）
+        (p / "continuity.md").write_text(
+            "## 时间轴\n\n| 集 | 起 | 止 | 说明 |\n|---|---|---|---|\n"
+            "| 1 | 第一天 | 第二天 |  |\n| 2 | 第九天 | 第十天 |  |\n",
+            encoding="utf-8")
+        r_gap = CY.check(p, const=CONST)
+        check("时间轴断口 → 报",
+              "时间轴有断口" in [w["check"] for w in r_gap["warning"]],
+              str([w["check"] for w in r_gap["warning"]]))
+        (p / "continuity.md").write_text(
+            "## 时间轴\n\n| 集 | 起 | 止 | 说明 |\n|---|---|---|---|\n"
+            "| 1 | 第一天 | 第二天 |  |\n| 2 | 第二天 | 第三天 |  |\n",
+            encoding="utf-8")
+        r_nogap = CY.check(p, const=CONST)
+        check("首尾相接 → 不报断口",
+              "时间轴有断口" not in [w["check"] for w in r_nogap["warning"]],
+              str([w["check"] for w in r_nogap["warning"]]))
+
+
+def t_no_dead_config():
+    """config 里的每个键都必须真被代码消费——空转的开关比没有开关更坏。"""
+    import re as _re
+    import tomllib
+    root = Path(__file__).resolve().parents[2]
+    cfg = root / "config" / "dramakit.toml"
+    if not cfg.exists():
+        check("能找到 config", False, str(cfg))
+        return
+    data = tomllib.loads(cfg.read_text(encoding="utf-8"))
+    src = "\n".join(p.read_text(encoding="utf-8")
+                    for p in sorted((root / "engine").rglob("*.py")))
+    tokens = set(m.group(0) for m in _re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", src))
+
+    def leaves(obj, prefix=""):
+        out = []
+        for k, v in obj.items():
+            p = f"{prefix}.{k}" if prefix else k
+            out.extend(leaves(v, p) if isinstance(v, dict) else [p])
+        return out
+
+    no_source = {
+        "motion_comic.asset.expression_enum",
+        "motion_comic.asset.costume_enum_required",
+        "anime.asset.char_views",
+    }
+    dead = [p for p in leaves(data)
+            if p.split(".")[-1] not in tokens and p not in no_source]
+    check("config 无空转键", not dead, "空转：" + "、".join(dead))
+    # 阈值必须与判据同源：cliff 门槛不能超过它能达到的满分
+    cf = data.get("cliff") or {}
+    sc = cf.get("score") or {}
+    base = sum(float(sc.get(k, 0)) for k in
+               ("line_hook", "visual_event", "emotion_close", "cliff_question"))
+    check("cliff 门槛不高于基础满分",
+          float(cf.get("cliff_score_min", 0)) <= base + 
+          sum(float(sc.get(k, 0)) for k in ("info_reverse", "call_back")),
+          f"门槛 {cf.get('cliff_score_min')} vs 基础满分 {base}")
+
+
 CASES = [
     ("A 节拍配比", t_beats),
     ("B 分镜骨架", t_skeleton),
@@ -797,6 +1100,8 @@ CASES = [
     ("P 故事质量评分卡", t_quality),
     ("Q 命令行接线", t_wiring),
     ("R 断点续跑与站位", t_progress),
+    ("S 判据不静默失效", t_no_silent_fail),
+    ("T config 无空转", t_no_dead_config),
 ]
 
 
