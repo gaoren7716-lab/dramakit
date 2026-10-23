@@ -197,8 +197,25 @@ def to_csv(rows: list[dict]) -> str:
 # 交付校验
 # ------------------------------------------------------------
 
+def _is_oner(text: str, rows: list) -> bool:
+    """一镜到底（oner）：整部只有一个镜头，全程不切。
+
+    ★ 必须**同时**满足两个条件才算：
+      1. 基本信息里显式写「一镜到底：是」
+      2. 分镜表确实只有 1 行
+
+    只认声明不认行数，等于给了一个**万能开关**——写一句话就能绕过单镜时长、
+    景别白名单、场景覆盖三条判据，而且没人会再回头看它。
+    反过来只认行数不认声明也不行：9 镜的稿子少写了几行也会变成"1 行"，
+    那是漏填，不是一镜到底。**声明与表必须互相印证。**
+    """
+    if len(rows) != 1:
+        return False
+    return bool(re.search(r"一镜到底\s*[:：]\s*是", text))
+
+
 def _check_body(text: str, header: list[str], const: dict | None = None,
-                form: str | None = None) -> list[str]:
+                form: str | None = None, notes: list[str] | None = None) -> list[str]:
     """核对分镜表**表体**（表头下面的数据行）。
 
     查四样，都是机械可判的：
@@ -244,6 +261,14 @@ def _check_body(text: str, header: list[str], const: dict | None = None,
         problems.append("分镜表没有数据行（只有表头，不是定稿）")
         return problems
 
+    notes = notes if notes is not None else []
+    oner = _is_oner(text, rows)
+    # 声明了一镜到底，表里却有多个镜头——**声明与表不符**。
+    # 这种稿子最危险：写的人以为自己拍的是长镜头，实际交付的是分镜表，
+    # 现场按哪个来都对不上。
+    if not oner and len(rows) > 1 and re.search(r"一镜到底\s*[:：]\s*是", text):
+        problems.append(f"声明「一镜到底：是」，但分镜表有 {len(rows)} 行")
+
     # 镜号连续
     nos = []
     for cells in rows:
@@ -280,8 +305,18 @@ def _check_body(text: str, header: list[str], const: dict | None = None,
         if bad:
             problems.append(f"时长不是正数：{'、'.join(bad[:6])}")
         if over:
-            problems.append(f"时长超过单镜上限 {hard:g}s：{'、'.join(over[:6])}"
-                            f"（超了生成端出不来）")
+            # ★ 一镜到底的超长镜**不拦，但必须说出来**。
+            #   60 秒不切在真人实拍里是合法的（排练、走位、焦点都靠调度），
+            #   可它一定超出 AI 生成端的单镜上限——那才是真会失败的地方。
+            #   拦下来等于告诉老板"一镜到底不能拍"，那是尺子用反；
+            #   静默放过等于让人拿着 60s 去跑生成端，那是另一种坑。
+            #   **不假装没事，也不假装不行**：降为提示，写清只走真人实拍。
+            if oner:
+                notes.append(f"一镜到底：{over[0]}，超过生成端单镜上限 {hard:g}s"
+                             f"——这一镜只能真人实拍，AI 生成档做不了")
+            else:
+                problems.append(f"时长超过单镜上限 {hard:g}s：{'、'.join(over[:6])}"
+                                f"（超了生成端出不来）")
 
     # 景别在册：写错景别，模型抽出来的提示词就是错的
     if "景别" in header:
@@ -293,6 +328,11 @@ def _check_body(text: str, header: list[str], const: dict | None = None,
                 continue
             v = cells[si].strip()
             if v and v not in allowed:
+                # ★ 一镜到底的景别**必然在镜内变化**（"全景起，镜内推至近景"）。
+                #   要求它写成一个词，是拿分镜的规矩管长镜头——长镜头没有"一个景别"。
+                #   取首个命中的白名单词判起点景别；连起点都不在册才报。
+                if oner and any(v.startswith(a) for a in allowed):
+                    continue
                 bad_sz.append(f"镜{cells[0]}({v})")
         if bad_sz:
             problems.append(f"景别不在白名单：{'、'.join(bad_sz[:6])}（可用：{'、'.join(allowed)}）")
@@ -387,7 +427,8 @@ def check_delivery(text: str, const: dict | None = None,
     bad_cols = [c for c in cols if c not in got]
 
     # ★ 表体核对：数据行、镜号连续、时长合法
-    body_problems = _check_body(text, got, {"drama": d}, frm)
+    body_notes: list[str] = []
+    body_problems = _check_body(text, got, {"drama": d}, frm, body_notes)
 
     # 验收额度必须落在"每镜几次 + 失败怎么办"这两件事上。
     # 用词分两种：AI 生成叫"重抽"，真人实拍叫"拍几条"，两种都认。
@@ -440,8 +481,16 @@ def check_delivery(text: str, const: dict | None = None,
             if len(cells) != len(got) or not cells[0].isdigit():
                 continue
             who = cells[got.index("谁在画面")]
-            for name in re.split(r"[、,，/／+＋和与\s]+", who):
-                name = name.strip("（）()【】[]")
+            # ★ `·` 与 `・` 是老板模板里的人名分隔符（"周海 · 小李"）。
+            #   不放进分隔符里，整串会被当成**一个人名**去比对，然后报"未登记"。
+            for name in re.split(r"[、,，/／+＋和与·・\s]+", who):
+                # ★ 顺序不能反：**先剥括注，再 strip 首尾括号**。
+                #   反了就出事——「13楼女人（末6秒入画）」先 strip 掉右括号，
+                #   变成不闭合的「13楼女人（末6秒入画」，正则匹配不上，
+                #   整个人名连注释一起被报"未登记"。判据自己读瞎，比漏判更坏：
+                #   它逼人去改本来没写错的稿子。
+                name = re.sub(r"[（(][^）)]*[）)]", "", name).strip()
+                name = name.strip("（）()【】[]·・-")
                 if (len(name) >= 2 and name not in WHO_STOP
                         and not is_object_name(name)
                         and not re.fullmatch(r"[\d.]+s?", name)):
@@ -467,6 +516,7 @@ def check_delivery(text: str, const: dict | None = None,
 
     # 附带提醒：交付只该有一个 .md，不该夹带提示词或参考图说明
     extras = []
+    extras.extend(body_notes)
     # ★ 人物对账降为**提醒**，不是阻断：这条靠"谁在画面"列的文本切分猜人名，
     #   列里合法地会出现物件（手机屏幕/便签）、群体（两人）、无主体（空镜）。
     #   判错了就拦稿，人立刻会把这条关掉——**宁可漏，不可吵**。

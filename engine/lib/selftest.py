@@ -1215,6 +1215,94 @@ def t_boss_template():
           str(s2[0]["visual"] if s2 else None))
 
 
+# ---------------------------------------------------------------------------
+# V 一镜到底 —— 声明 + 1 行才成立，不能变成万能开关
+# ---------------------------------------------------------------------------
+ONER_DOC = (
+    "# 测试剧\n\n"
+    "## 0. 状态\n\n定稿，不再改台词：是\n\n"
+    "## 1. 基本信息（一行一项）\n\n"
+    "剧名：测试剧\n类型 / 受众：测试 / 测试\n"
+    "画幅时长：竖屏9:16，约60秒，1镜\n"
+    "一镜到底：是（整部只有1个镜头，全程不切）\n"
+    "风格二选一：真人\n结尾字幕原文：完。\n\n"
+    "## 2. 人物（每人4行，写死，内部不能矛盾）\n\n"
+    "姓名｜年龄｜身份：周海｜28岁｜测试员\n"
+    "长相锁定：寸头\n服装锁定：蓝工服（镜1）\n贯穿道具：手机（镜1）\n\n"
+    "姓名｜年龄｜身份：13楼女人｜30岁｜住户\n"
+    "长相锁定：头发随手扎着\n服装锁定：灰家居裤（镜1）\n贯穿道具：垃圾袋（镜1）\n\n"
+    "## 3. 场景（每场景一段）\n\n"
+    "电梯轿厢（镜1）｜深夜｜冷白顶灯｜按键面板\n"
+    "13楼楼道（镜1，同一镜内镜头跟出）｜深夜｜声控灯｜垃圾袋\n\n"
+    "## 4. 分镜表\n\n"
+    "镜号｜目标时长｜景别｜谁在画面｜动作一句话｜台词原文（无则写无）\n"
+    "01｜60s｜全景起，镜内推至近景｜周海 · 13楼女人（末6秒入画）｜"
+    "他进电梯按13楼，电梯停住，他按警铃没人应｜喂？我困在电梯里了。\n\n"
+    "## 5. 验收与额度（一行定死）\n\n"
+    "重抽上限：整条最多拍8条；锚定试镜（周海1条）我通过后才批量：是\n"
+    "失败处理：整条作废重拍，不做局部补拍\n"
+    "发布合规：挂 AIGC 标识「本片由 AI 生成合成」\n"
+)
+
+
+def t_oner() -> None:
+    """一镜到底：60 秒不切是合法形式，但不能变成绕过判据的万能开关。
+
+    ★ 这一组的重点是**反向证伪**：四条注入里有三条在证明"别放得太宽"。
+      只测"oner 稿能过"，等于给了一个后门还自夸门装得好。
+    """
+    # 1) 声明 + 1 行 → 格式完整
+    r = SL.check_delivery(ONER_DOC, form="live_action", is_ai=False)
+    check("oner·声明+1行通过", r["ok"], str(r["problems"]))
+
+    # 2) 但必须**说出来**：这一镜超出生成端上限，只能真人实拍。
+    #    不假装没事——静默放过会让人拿着 60s 去跑 AI 生成，那才是真坑。
+    check("oner·超生成上限必须提示",
+          any("一镜到底" in w and "真人实拍" in w for w in r["warnings"]),
+          str(r["warnings"]))
+
+    # 3) ★ 注入：声明了却写了 3 行 → 声明与表不符，必须拦
+    three = ONER_DOC.replace(
+        "他进电梯按13楼，电梯停住，他按警铃没人应｜喂？我困在电梯里了。",
+        "他进电梯按13楼｜无\n"
+        "02｜20s｜近景｜周海｜他按警铃｜无\n"
+        "03｜20s｜近景｜周海｜门开了｜无"
+    ).replace("约60秒，1镜", "约100秒，3镜")
+    r3 = SL.check_delivery(three, form="live_action", is_ai=False)
+    check("注入·声明一镜到底却有多镜被拦",
+          not r3["ok"] and any("一镜到底" in p and "行" in p for p in r3["problems"]),
+          str(r3["problems"]))
+
+    # 4) ★ 注入：只有 1 行但**没声明** → 60 秒照样必须报超限。
+    #    只认行数不认声明，等于让"少填了几行"冒充一镜到底。
+    no_decl = ONER_DOC.replace("一镜到底：是（整部只有1个镜头，全程不切）\n", "")
+    r4 = SL.check_delivery(no_decl, form="live_action", is_ai=False)
+    check("注入·1行但未声明仍按超限拦",
+          not r4["ok"] and any("上限" in p for p in r4["problems"]),
+          str(r4["problems"]))
+
+    # 5) ★ 注入：oner 的景别放宽只放到"起点在册"为止。
+    #    写"荒谬景别起"必须照样红——否则这条放宽就把景别判据整个废了。
+    bad_sz = ONER_DOC.replace("全景起，镜内推至近景", "荒谬景别起，镜内推至近景")
+    r5 = SL.check_delivery(bad_sz, form="live_action", is_ai=False)
+    check("注入·oner 起点景别不在册被拦",
+          not r5["ok"] and any("景别" in p for p in r5["problems"]),
+          str(r5["problems"]))
+
+    # 6) ★ 注入：**非 oner** 的稿子写复合景别，必须照旧红。
+    #    放宽只属于 oner，不能顺带把 9 镜稿的规矩松了。
+    r6 = SL.check_delivery(BOSS_DOC.replace("01｜4s｜近景", "01｜4s｜全景起，推至近景"),
+                           form="live_action", is_ai=False)
+    check("注入·非oner复合景别仍被拦",
+          not r6["ok"] and any("景别" in p for p in r6["problems"]),
+          str(r6["problems"]))
+
+    # 7) 人物名带括注 + · 分隔，不该报"未登记"
+    r7 = SL.check_delivery(ONER_DOC, form="live_action", is_ai=False)
+    check("oner·带括注人名不误报未登记",
+          not any("未见登记" in w for w in r7["warnings"]), str(r7["warnings"]))
+
+
 CASES = [
     ("A 节拍配比", t_beats),
     ("B 分镜骨架", t_skeleton),
@@ -1237,6 +1325,7 @@ CASES = [
     ("S 判据不静默失效", t_no_silent_fail),
     ("T config 无空转", t_no_dead_config),
     ("U 老板提交模板", t_boss_template),
+    ("V 一镜到底", t_oner),
 ]
 
 

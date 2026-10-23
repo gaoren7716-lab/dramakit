@@ -199,12 +199,17 @@ def audit(path: Path) -> list[str]:
                 if not overlay:
                     real[k] = real.get(k, 0) + 1
     if n:
+        # ★ 一镜到底（oner）：**一个镜头穿过多于一个空间，是形式定义，不是抢镜。**
+        #   电梯跟到楼道，全片只有这一个镜头，但它经过两个地点。
+        #   判定条件与 shotlist 一致：声明「一镜到底：是」且全片只有 1 镜。
+        #   只认声明不认镜数，就等于给了一个万能开关——写一句话绕过所有覆盖检查。
+        oner = n == 1 and bool(re.search(r"一镜到底\s*[:：]\s*是", text))
         missing = [k for k in range(1, n + 1) if total.get(k, 0) == 0]
         dup = [k for k in range(1, n + 1) if real.get(k, 0) > 1]
         extra = [k for k in total if k > n]
         if missing:
             problems.append(f"场景没覆盖：镜{'、'.join(map(str, missing))}")
-        if dup:
+        if dup and not oner:
             problems.append(f"同一镜被两个实景同时认领：镜{'、'.join(map(str, dup))}")
         if extra:
             problems.append(f"场景写了不存在的镜号：镜{'、'.join(map(str, sorted(extra)))}")
@@ -320,6 +325,39 @@ def selftest() -> int:
     want("规格数字不当镜号",
          _ranges("同意书（镜1、3），A4纸，边角被捏软了") == [(1, 1), (3, 3)],
          str(_ranges("同意书（镜1、3），A4纸，边角被捏软了")))
+
+    # ★ 一镜到底：一个镜头穿过多于一个空间，是**形式定义**，不是抢镜。
+    #   但这条放宽必须同时证明"别放得太宽"——只测能过等于给自己开后门。
+    oner_doc = (
+        "# 测试剧\n\n"
+        "## 1. 基本信息（一行一项）\n\n"
+        "画幅时长：竖屏9:16，约60秒，1镜\n"
+        "一镜到底：是（整部只有1个镜头，全程不切）\n\n"
+        "## 2. 人物（每人4行）\n\n"
+        "姓名｜年龄｜身份：周海｜28岁｜测试员\n"
+        "长相锁定：寸头\n服装锁定：蓝工服（镜1）\n贯穿道具：手机（镜1）\n\n"
+        "## 3. 场景（每场景一段）\n\n"
+        "电梯轿厢（镜1）｜深夜｜冷白顶灯｜按键面板\n"
+        "13楼楼道（镜1）｜深夜｜声控灯｜垃圾袋\n\n"
+        "## 4. 分镜表\n\n"
+        "镜号｜目标时长｜景别｜谁在画面｜动作一句话｜台词原文（无则写无）\n"
+        "01｜60s｜全景｜周海｜他进电梯按13楼｜无\n"
+    )
+    with tempfile.TemporaryDirectory() as sandbox:
+        p = Path(sandbox) / "oner-提交版.md"
+        p.write_text(oner_doc, encoding="utf-8")
+        ps_oner = audit(p)
+    want("oner·跨空间不报抢镜", not any("两个实景" in x for x in ps_oner),
+         "\n".join(ps_oner))
+
+    # 去掉声明：同样的场景写法必须照旧红——放宽只属于 oner。
+    with tempfile.TemporaryDirectory() as sandbox:
+        p = Path(sandbox) / "not-oner-提交版.md"
+        p.write_text(oner_doc.replace("一镜到底：是（整部只有1个镜头，全程不切）\n", ""),
+                     encoding="utf-8")
+        ps_plain = audit(p)
+    want("非oner·跨空间仍报抢镜", any("两个实景" in x for x in ps_plain),
+         "\n".join(ps_plain))
 
     print(f"\n{len(fails)} 项失败" if fails else "\n全部通过")
     return 1 if fails else 0
