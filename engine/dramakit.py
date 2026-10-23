@@ -167,6 +167,33 @@ def _proj_meta(proj: Path) -> dict:
     return {}
 
 
+def _resolve_mode(proj: Path | None, arg_mode: str | None, frm: str | None) -> str:
+    """解析当前生效的镜头档位（`ai` / `live`）。
+
+    优先级：`--mode` > project.json 的 shot_profile > 项目 overrides 的
+    `[drama].shot_profile` > 全局默认 `ai`。
+
+    ★ 为什么不能只读 project.json：档位通常写在
+      `projects/<名>/config/overrides.toml`（`shot_profile = "live"`），
+      project.json 里根本没有这个字段。只读 json 会静默回落成 ai，
+      于是真人项目的 9s/10s 长镜被 AI 档 8s 上限拦下——尺子用反。
+
+    ★ 为什么不能算完 const 再回读：那个键**在无项目时不存在**，
+      `.get("shot_profile", "ai")` 静默回落，于是同一份 const 里
+      时长判据走真人档 sec_max=10、AIGC 判据走 AI 档要求挂"本片由 AI 生成合成"。
+      **两条判据走了两个档位，而且两边都不报错。**
+
+    ★ 所以做法是"探一次、取到项目档位、再用它重算 const"：
+      探出来的 const 只用来读档位，不用来判任何东西。
+    """
+    if arg_mode:
+        return str(arg_mode)
+    probe = constants_for(proj, None, form=frm)
+    return str((_proj_meta(proj).get("shot_profile") if proj else None)
+               or probe["drama"].get("shot_profile")
+               or "ai")
+
+
 # ------------------------------------------------------------
 # plan
 # ------------------------------------------------------------
@@ -228,16 +255,14 @@ def cmd_scan(args):
     proj = Path(args.project) if args.project else SC.find_project_root(p)
     # 形态兜底：显式 --form > 项目 project.json 的 form > 全局
     frm = args.form or (_proj_meta(proj).get("form") if proj else None)
-    const = constants_for(proj, args.mode, form=frm) if proj \
-        else constants_for(None, args.mode, form=frm)
+    # ★ **档位先解析，再算常数**，顺序不能反（见 _resolve_mode 的说明）。
+    mode = _resolve_mode(proj, args.mode, frm)
+    const = constants_for(proj, mode, form=frm)
     # ★ 规模（single/series）必须读 project.json：连载项目按单集判据质检，
     #   时长/镜数/结尾余味全按错的尺子量（连载压根不查单集时长与镜数，
     #   结尾镜要求是钩子不是余味长镜）。
     #   实测：project.json 写 format=series，不带 --format 时恒按 single 走。
     fmt = args.format or (_proj_meta(proj).get("format") if proj else None) or "single"
-    # 档位与 is_ai 必须同源：只认 --live-shoot 不看解析出的档位，
-    # 项目里写了 shot_profile = "live" 也会被 AI 后端 8s 上限拦下。
-    mode = str(args.mode or const["drama"].get("shot_profile", "ai"))
     is_ai = False if args.live_shoot else (mode != "live")
 
     if args.changed:
@@ -325,12 +350,13 @@ def cmd_check(args):
         raise SystemExit(f"找不到文件：{p}")
     proj = find_project_root(p)
     frm = args.form or (_proj_meta(proj).get("form") if proj else None)
-    # ★ 档位也必须传：不传就永远按 ai 档解析，于是真人项目的 9s/10s 长镜
-    #   被 AI 档的 8s 上限拦下——**尺子用反**（同族：is_ai 不看解析出的档位）。
-    #   档位来源优先级：--mode > 项目 shot_profile > 全局默认。
-    mode = args.mode or (_proj_meta(proj).get("shot_profile") if proj else None)
+    # ★ 档位必须先解析再算常数，且 is_ai 只能由**解析后的档位**推。
+    #   踩过两次：① 只认 --live-shoot 不看档位；② 算完 const 再回读
+    #   `const["drama"]["shot_profile"]`，而那个键无项目时不存在，静默回落成 ai——
+    #   于是同一份 const 里，时长走真人档 10s（对）、AIGC 走 AI 档（错，
+    #   给实拍片挂"本片由 AI 生成合成"是虚假标注）。详见 _resolve_mode。
+    mode = _resolve_mode(proj, args.mode, frm)
     const = constants_for(proj, mode, form=frm)
-    mode = str(const["drama"].get("shot_profile", "ai"))
     is_ai = False if args.live_shoot else (mode != "live")
     res = SL.check_delivery(p.read_text(encoding="utf-8"), const,
                             form=frm, is_ai=is_ai)

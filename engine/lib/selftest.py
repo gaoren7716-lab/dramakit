@@ -1302,6 +1302,35 @@ def t_oner() -> None:
     check("oner·带括注人名不误报未登记",
           not any("未见登记" in w for w in r7["warnings"]), str(r7["warnings"]))
 
+    # 8) ★ CLI 层：live 档不该要求挂「本片由 AI 生成合成」。
+    #   给实拍片挂 AI 标识是**虚假标注**，比不挂更糟。
+    #   踩过的坑：CLI 从 const 回读 shot_profile 决定 is_ai，而那个键在 const 里
+    #   根本不存在，`.get("shot_profile", "ai")` 静默回落成 "ai"——于是**同一份
+    #   const 里，时长判据走真人档 sec_max=10（对）、AIGC 判据走 AI 档（错）**。
+    #   这条必须在 CLI 层测：只测 lib 的 is_ai 参数永远测不到档位推导那一段。
+    import subprocess
+    import tempfile
+    root = Path(__file__).resolve().parents[2]
+    cli = root / "engine" / "dramakit.py"
+    # 样本里**去掉** AIGC 字样，否则 ai 档也不会报缺失，测不出任何东西。
+    no_aigc = ONER_DOC.replace(
+        "发布合规：挂 AIGC 标识「本片由 AI 生成合成」\n",
+        "发布合规：本片为真人实拍\n")
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "oner-提交版.md"
+        f.write_text(no_aigc, encoding="utf-8")
+
+        def _cli(mode):
+            return subprocess.run(
+                [sys.executable, str(cli), "check", str(f),
+                 "--form", "live_action", "--mode", mode],
+                capture_output=True, text=True, encoding="utf-8",
+                cwd=str(root)).stdout
+
+        out_live, out_ai = _cli("live"), _cli("ai")
+    check("CLI·live 档不要求 AIGC 标识", "AIGC" not in out_live, out_live[-300:])
+    check("CLI·ai 档仍要求 AIGC 标识", "AIGC" in out_ai, out_ai[-300:])
+
 
 CASES = [
     ("A 节拍配比", t_beats),
