@@ -290,6 +290,33 @@ def _check_body(text: str, header: list[str], const: dict | None = None,
         if bad_sz:
             problems.append(f"景别不在白名单：{'、'.join(bad_sz[:6])}（可用：{'、'.join(allowed)}）")
 
+    # ★ 基本信息里的「约 N 秒 / M 镜」必须和分镜表加起来一致。
+    #   这条最容易漏：改分镜时加了一镜、砍了两秒，抬头那句"约60秒9镜"没人回头改，
+    #   于是稿子上写着 60 秒、实际 56 秒，一路送到生成端才被时长坑到。
+    #   老板的模板把「内部不能矛盾」写在人物那一节，但**数字的自洽同样是自洽**。
+    #   容差给 3%：写的是"约"，但 60 秒的片子差 4 秒就是 7%，不能算"约"。
+    #   镜数必须精确——少一镜现场就少一镜，没有"约 9 镜"这回事。
+    info_m = re.search(r"^#+\s*(?:[一二三四五六七八九十\d]+\s*[、.．]?\s*)?基本信息[^\n]*$"
+                       r"(.*?)(?=^#|\Z)", text, re.M | re.S)
+    if info_m and rows:
+        blk = info_m.group(1)
+        msec = re.search(r"约\s*(\d+(?:\.\d+)?)\s*秒", blk)
+        mn = re.search(r"(\d+)\s*镜", blk)
+        ti2 = 1 if len(header) > 1 else -1
+        real_sec = 0.0
+        if ti2 >= 0:
+            for cells in rows:
+                if len(cells) > ti2:
+                    mm = re.search(r"(\d+(?:\.\d+)?)", cells[ti2])
+                    if mm:
+                        real_sec += float(mm.group(1))
+        if msec and real_sec:
+            said = float(msec.group(1))
+            if abs(said - real_sec) > max(1.0, said * 0.03):
+                problems.append(f"基本信息写「约{said:g}秒」，分镜表实际加起来 {real_sec:g} 秒")
+        if mn and int(mn.group(1)) != len(rows):
+            problems.append(f"基本信息写「{mn.group(1)} 镜」，分镜表实际 {len(rows)} 行")
+
     # 画面/台词列不能整列是占位符（没填的骨架不能当定稿发出去）
     for label in ("动作一句话", "画面一句话"):
         if label not in header:

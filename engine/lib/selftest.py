@@ -1191,6 +1191,20 @@ def t_boss_template():
     check("注入·超单镜上限被拦", not r3["ok"] and any("上限" in p for p in r3["problems"]),
           str(r3["problems"]))
 
+    # 4) 抬头写"约99秒"、实际 12 秒：数字自己跟自己对不上
+    r4 = SL.check_delivery(BOSS_DOC.replace("约12秒，3镜", "约99秒，3镜"),
+                           form="live_action", is_ai=False)
+    check("注入·时长与分镜表对不上被拦",
+          not r4["ok"] and any("约99秒" in p for p in r4["problems"]),
+          str(r4["problems"]))
+
+    # 5) 抬头写"4镜"、实际 3 行：镜数没有"约"
+    r5 = SL.check_delivery(BOSS_DOC.replace("约12秒，3镜", "约12秒，4镜"),
+                           form="live_action", is_ai=False)
+    check("注入·镜数与分镜表对不上被拦",
+          not r5["ok"] and any("4 镜" in p for p in r5["problems"]),
+          str(r5["problems"]))
+
     # markdown 表格里单元格内的全角竖线必须留着（一刀切会切碎「周宁｜推门」）
     md = ("| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |\n"
           "|---|---|---|---|---|---|\n"
