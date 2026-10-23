@@ -929,25 +929,27 @@ def t_no_silent_fail():
     check("报出景别问题", any("景别" in p for p in el_res["problems"]),
           str(el_res["problems"]))
 
-    # 人物表对账：分镜表出场了却没登记 → 必须报
+    # 人物表对账：分镜表出场了却没登记 → 必须报（报在提醒里，不拦稿）
     unreg = two.replace("| 3 | 4s | 中景 | 林晚 | 她起身 | 我走了 |",
                         "| 3 | 4s | 中景 | 张三 | 他起身 | 我走了 |", 1)
     check("注入未登记人物确实改到了", unreg != two)
     ur_res = SL.check_delivery(unreg, CONST, form="live_action", is_ai=True)
-    check("未登记人物 → 报",
-          any("未登记" in p and "张三" in p for p in ur_res["problems"]),
+    check("未登记人物 → 提醒里报",
+          any("未见登记" in w and "张三" in w for w in ur_res["warnings"]),
+          str(ur_res["warnings"]))
+    check("未登记人物不拦稿（宁可漏不可吵）", ur_res["ok"],
           str(ur_res["problems"]))
     check("已登记人物不误报",
-          not any("未登记" in p for p in SL.check_delivery(
-              two, CONST, form="live_action", is_ai=True)["problems"]),
-          str(SL.check_delivery(two, CONST, form="live_action", is_ai=True)["problems"]))
-    # 占位词不能当没登记的人名（"空镜""两人"）
-    ph = two.replace("| 3 | 4s | 中景 | 林晚 | 她起身 | 我走了 |",
-                     "| 3 | 4s | 中景 | 空镜 | 房间空了 | — |", 1)
-    check("占位不当未登记人物",
-          not any("未登记" in p for p in
-                  SL.check_delivery(ph, CONST, form="live_action", is_ai=True)["problems"]),
-          str(SL.check_delivery(ph, CONST, form="live_action", is_ai=True)["problems"]))
+          not any("未见登记" in w for w in SL.check_delivery(
+              two, CONST, form="live_action", is_ai=True)["warnings"]),
+          str(SL.check_delivery(two, CONST, form="live_action", is_ai=True)["warnings"]))
+    # 占位词与非人主体都不能当没登记的人名（"空镜""两人""手机屏幕"）
+    for ph_who in ("空镜", "两人", "手机屏幕"):
+        ph = two.replace("| 3 | 4s | 中景 | 林晚 | 她起身 | 我走了 |",
+                         f"| 3 | 4s | 中景 | {ph_who} | 房间空了 | — |", 1)
+        got_w = SL.check_delivery(ph, CONST, form="live_action", is_ai=True)["warnings"]
+        check(f"「{ph_who}」不当未登记人物",
+              not any("未见登记" in w for w in got_w), str(got_w))
 
     # 9) cliff 评分：口径必须百分制，强卡点能到 100、弱卡点不合格
     import cliff as CF

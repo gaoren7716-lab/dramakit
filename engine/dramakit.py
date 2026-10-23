@@ -325,9 +325,11 @@ def cmd_check(args):
         raise SystemExit(f"找不到文件：{p}")
     proj = find_project_root(p)
     frm = args.form or (_proj_meta(proj).get("form") if proj else None)
-    const = constants_for(proj, form=frm)
-    # 和 scan 同一条规矩：is_ai 跟着解析出的档位走。
-    # 真人项目被要求"AIGC 标识"是尺子用反了——它本来就不是 AI 生成的。
+    # ★ 档位也必须传：不传就永远按 ai 档解析，于是真人项目的 9s/10s 长镜
+    #   被 AI 档的 8s 上限拦下——**尺子用反**（同族：is_ai 不看解析出的档位）。
+    #   档位来源优先级：--mode > 项目 shot_profile > 全局默认。
+    mode = args.mode or (_proj_meta(proj).get("shot_profile") if proj else None)
+    const = constants_for(proj, mode, form=frm)
     mode = str(const["drama"].get("shot_profile", "ai"))
     is_ai = False if args.live_shoot else (mode != "live")
     res = SL.check_delivery(p.read_text(encoding="utf-8"), const,
@@ -521,6 +523,8 @@ def build_parser():
     s = sub.add_parser("check", help="交付格式校验")
     s.add_argument("path")
     s.add_argument("--form", choices=list(FORMS))
+    s.add_argument("--mode", choices=["ai", "live"],
+                   help="镜头语言档位（不传则读项目 shot_profile，再退回全局）")
     s.add_argument("--live-shoot", action="store_true")
     s.set_defaults(fn=cmd_check)
 
