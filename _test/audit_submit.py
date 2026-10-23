@@ -21,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "engine" / "lib"))
 
-from common import is_row, norm_head, split_row          # noqa: E402
+from common import is_object_name, is_row, norm_head, split_row   # noqa: E402
 import scan as SC                                        # noqa: E402
 
 # 这些"谁在画面"是物件/群体/介质，不需要在人物表登记。
@@ -32,6 +32,14 @@ NOT_A_PERSON = {
     "报表", "门", "窗", "墙", "桌子", "椅子", "电梯", "监控", "画面文字", "门缝",
     "镜子", "轮椅", "床", "窗帘", "两个同学", "同学们", "同学", "路人", "众人",
     "服务员", "群演", "两个男生", "三个男生",
+    # ★ 与 shotlist.WHO_STOP / quality.WHO_NOT_A_NAME 三处同步。
+    #   三处不同步的后果：check 说不报、audit 说报，然后没人再信任何一边。
+    "八仙桌", "桌面", "床头柜", "收银台", "柜台", "台面",
+    "判决书", "协议书", "通报文件", "通报", "文件", "单据", "发票",
+    "账本", "病历", "房产证", "菜单", "作业本", "点单本",
+    # ★ 第三批（实测报出来的）：物件表是知识缺口，不是规则。
+    "门牌", "工资条", "告示牌", "招牌", "推床", "输液架", "病历本", "挂号单",
+    "笔录", "询问笔录", "签字单",
 }
 
 
@@ -59,29 +67,69 @@ def _shot_rows(text: str) -> list[list[str]]:
 def _ranges(s: str) -> list[tuple[int, int]]:
     """从一段文字里抠出所有镜号区间。
 
-    认三种写法，缺一种就会把"覆盖完整"误报成"漏了"：
-      - `镜3至6` / `镜3-6` / `镜3~6`  → 区间
-      - `镜8、9` / `镜1,2,3`          → 枚举（**踩过的坑**：只认"镜N"会把
-        "镜8、9"读成只有镜 8，于是镜 9 被判成"场景没覆盖"，其实是脚本瞎了）
-      - `镜7`                          → 单镜
+    写法比想象的多，少认一种就把"覆盖完整"误报成"漏了"：
+      - `镜3至6` / `镜3-6` / `镜3~6`   → 区间
+      - `镜8、9` / `镜1,2,3`           → 枚举
+      - `镜1至5、7至9`                 → **区间与枚举混排**
+      - `镜7`                           → 单镜
+
+    ★ 踩过的坑（两次，同一根）：
+      第一版只认 `镜N`，于是「镜8、9」读成只有镜 8，镜 9 被判"没覆盖"。
+      第二版加了枚举，但枚举正则要求每项都带"镜"字前缀，于是
+      「镜1至5、7至9」里的 `7至9` 没有"镜"字，整段只读出 (1,5)，
+      镜 7、8、9 全被判"没覆盖"——稿子是对的，脚本瞎了。
+
+    ★ 所以现在不按"每个正则各自扫全文"写，而是**先按"镜"字切段，
+      段内再按顿号切项**。一条"镜"字管它后面的一串，这才是人写这句话的语义。
     """
-    out = []
-    spans = []
-    for m in re.finditer(r"镜\s*(\d+)\s*(?:至|-|~|—)\s*(\d+)", s):
-        out.append((int(m.group(1)), int(m.group(2))))
-        spans.append(m.span())
-    # 枚举：镜N 后面跟一串 "、M"
-    enum_spans = []
-    for m in re.finditer(r"镜\s*(\d+)((?:\s*[、,，]\s*\d+)+)", s):
-        nums = [int(m.group(1))] + [int(x) for x in re.findall(r"\d+", m.group(2))]
-        out.extend((k, k) for k in nums)
-        enum_spans.append(m.span())
-    for m in re.finditer(r"镜\s*(\d+)", s):
-        if any(a <= m.start() < b for a, b in spans + enum_spans):
+    out: list[tuple[int, int]] = []
+    starts = [m.start() for m in re.finditer(r"镜", s)]
+    for i, st in enumerate(starts):
+        seg = s[st + 1: starts[i + 1] if i + 1 < len(starts) else len(s)]
+        # ★ 只取**紧跟着"镜"字的那一串镜号**。遇到第一个不是数字/顿号/逗号/
+        #   区间符的字符就截断——因为从那里往后已经不是镜号了。
+        #   不截断的后果（实测踩到）：
+        #   「健身卡（镜1、5、8、9），卡面印着有效期至2029年」
+        #   里的 2029 被当成镜号，报「写到镜2029，但全片只有 9 镜」。
+        #   更阴的是「至」字：它既是区间连接符，也是普通汉字（有效期至）。
+        head = re.match(r"[\d\s、,，至~—\-]*", seg)
+        seg = head.group(0) if head else ""
+        if not seg:
             continue
-        n = int(m.group(1))
-        out.append((n, n))
+        for part in seg.split("|"):
+            for item in re.split(r"[、,，]", part):
+                item = item.strip()
+                # 以连接符开头的残片（「至2029」这种）不是镜号，丢掉
+                if not item or not item[0].isdigit():
+                    continue
+                rng = re.fullmatch(r"(\d+)\s*(?:至|~|—|-)\s*(\d+)", item)
+                if rng:
+                    out.append((int(rng.group(1)), int(rng.group(2))))
+                    continue
+                for num in re.findall(r"\d+", item):
+                    out.append((int(num), int(num)))
     return out
+
+
+def _same_person(who: str, names: set[str]) -> bool:
+    """「谁在画面」写的这个称呼，是否指向人物表里的某个人。
+
+    人物表登记「银行柜员」，分镜表写「柜员」——同一个人。
+    登记「一楼的父亲」，写「父亲」——也是同一个人。
+
+    认三种等价：完全相同 / 去掉定语（`X的Y` → `Y`）/ 是某人名的**后缀**。
+    ★ 后缀长度必须 ≥2：只留一个字的匹配会乱撞（「老王」和「王」不是一回事）。
+    """
+    if who in names:
+        return True
+    if who.rsplit("的", 1)[-1] in names:
+        return True
+    if len(who) >= 2:
+        for n in names:
+            if n != who and n.endswith(who):
+                return True
+    return False
+
 
 
 def audit(path: Path) -> list[str]:
@@ -109,9 +157,6 @@ def audit(path: Path) -> list[str]:
             problems.append(f"人物「{p['name']}」只有 {p['lines']} 行，模板要求 4 行")
 
     names = {p["name"] for p in people}
-    # 定语归一：人物表登记「一楼的父亲」，分镜表写「父亲」，是同一个人。
-    # ★ 这条坑踩过三次了（"床上的父亲" vs "父亲"），凡是人名对账都得归一。
-    short = {n.rsplit("的", 1)[-1] for n in names} | names
 
     # 2. 谁在画面 vs 人物表
     if rows:
@@ -128,7 +173,7 @@ def audit(path: Path) -> list[str]:
                     continue
                 for w in re.split(r"[·、,，/／+＋和与\s]+", cells[wi]):
                     w = w.strip("（）()【】[]")
-                    if not w or w in NOT_A_PERSON or w in short:
+                    if not w or w in NOT_A_PERSON or is_object_name(w) or _same_person(w, names):
                         continue
                     if re.fullmatch(r"[\d.]+s?", w):
                         continue
@@ -243,6 +288,38 @@ def selftest() -> int:
     want("枚举镜号解析", _ranges("出租屋（镜1、3）") == [(1, 1), (3, 3)],
          str(_ranges("出租屋（镜1、3）")))
     want("区间镜号解析", _ranges("镜2至5") == [(2, 5)], str(_ranges("镜2至5")))
+    # ★ 区间与枚举混排。踩过：第二版枚举正则要求每项都带"镜"字，
+    #   于是「镜1至5、7至9」只读出 (1,5)，镜 7、8、9 被判"没覆盖"。
+    want("混排镜号解析", _ranges("客厅（镜1至5、7至9）") == [(1, 5), (7, 9)],
+         str(_ranges("客厅（镜1至5、7至9）")))
+    want("混排含单镜", _ranges("镜1至3、5、7至9") == [(1, 3), (5, 5), (7, 9)],
+         str(_ranges("镜1至3、5、7至9")))
+    # ★ 人名后缀归一。踩过：人物表登记「银行柜员」，分镜表写「柜员」，
+    #   被当成"没登记的人"报出来——是判据不认人话。
+    want("人名后缀归一", _same_person("柜员", {"银行柜员", "宋长河"}),
+         "「柜员」应认作「银行柜员」")
+    want("人名定语归一", _same_person("父亲", {"一楼的父亲"}),
+         "「父亲」应认作「一楼的父亲」")
+    want("单字不归一", not _same_person("王", {"老王"}),
+         "「王」不能认作「老王」——单字会乱撞")
+    want("不同的人不归一", not _same_person("护工", {"蒋德海", "蒋晓梅"}),
+         "「护工」不在人物表就是不在")
+    # ★ 物件后缀规则。踩过：白名单只有「协议书」，稿子写「承揽协议书」，
+    #   被判成"这个人没登记"。判据不认人话，然后被整条关掉。
+    want("物件完全匹配", is_object_name("判决书"), "「判决书」是物件")
+    want("物件后缀匹配", is_object_name("承揽协议书"), "「承揽协议书」应以「协议书」后缀命中")
+    want("人名不是物件", not is_object_name("周长顺"), "「周长顺」是人")
+    want("单字不判物件", not is_object_name("书"), "单字不做后缀匹配")
+    # ★ 「至」既是区间连接符又是普通汉字。踩过：道具写
+    #   「健身卡（镜1、5、8、9），卡面印着有效期至2029年」，
+    #   2029 被当成镜号，报「写到镜2029，但全片只有 9 镜」。
+    want("年份不当镜号",
+         _ranges("健身卡（镜1、5、8、9），卡面印着有效期至2029年")
+         == [(1, 1), (5, 5), (8, 8), (9, 9)],
+         str(_ranges("健身卡（镜1、5、8、9），卡面印着有效期至2029年")))
+    want("规格数字不当镜号",
+         _ranges("同意书（镜1、3），A4纸，边角被捏软了") == [(1, 1), (3, 3)],
+         str(_ranges("同意书（镜1、3），A4纸，边角被捏软了")))
 
     print(f"\n{len(fails)} 项失败" if fails else "\n全部通过")
     return 1 if fails else 0

@@ -24,7 +24,7 @@ import re
 import sys
 from pathlib import Path
 
-from common import C, CONST, constants_for  # noqa: E402
+from common import C, CONST, constants_for, is_object_name  # noqa: E402
 
 ST_ = (CONST.get("drama") or {}).get("story") or {}
 
@@ -50,12 +50,17 @@ WHO_NOT_A_NAME = {
     "账单", "照片", "纸条", "信件", "合同", "报表", "门", "窗", "墙",
     "桌子", "椅子", "电梯", "监控", "画面文字", "门缝", "镜子",
     "同意书", "签字表", "表格", "纸", "轮椅", "床", "窗帘",
+    # ★ 与 shotlist.WHO_STOP 同步补的同一批。两处不同步的话，
+    #   会出现"check 不报、quality 报"的鬼话，然后没人再信任何一边。
+    "八仙桌", "桌面", "床头柜", "收银台", "柜台", "台面",
+    "判决书", "协议书", "通报文件", "通报", "文件", "单据", "发票",
+    "账本", "病历", "房产证", "菜单", "作业本", "点单本",
 }
 
 
 def _is_real_name(w: str) -> bool:
     """这个"谁在画面"格子里写的是不是一个人名。"""
-    if not w or w in WHO_PLACEHOLDERS or w in WHO_NOT_A_NAME:
+    if not w or w in WHO_PLACEHOLDERS or w in WHO_NOT_A_NAME or is_object_name(w):
         return False
     # ★ 单个字符一律不是人名，标点更不是。
     #   "老师 · 主任"按空白切开后会剩下一个"·"，它曾被当成第三个人物——

@@ -16,8 +16,8 @@ import re
 from pathlib import Path
 
 from common import (CONST, C, apply_form_profile, compliance_for, constants_for,
-                    is_row, norm_head, normalize_form, platform_for, sizes_for,
-                    split_row)
+                    is_object_name, is_row, norm_head, normalize_form, platform_for,
+                    sizes_for, split_row)
 from plan import ACTS, beats
 
 # 交付定稿的五块
@@ -77,6 +77,11 @@ WHO_STOP = {
     "空椅子", "名册", "社团名册", "第四把椅子", "欠条", "账单", "诊断书",
     "账单", "照片", "纸条", "信件", "合同", "报表", "门", "窗", "墙",
     "桌子", "椅子", "电梯", "楼道", "走廊", "监控", "画面文字",
+    # ★ 这张表是**知识缺口**，不是规则。见到新的物件主体就往里加，
+    #   别指望判据自己认出来——它只会说"这人没登记"，然后把整条判据吵到被关掉。
+    "八仙桌", "桌面", "床头柜", "收银台", "柜台", "台面",
+    "判决书", "协议书", "通报文件", "通报", "文件", "单据", "发票",
+    "账本", "病历", "房产证", "菜单", "作业本", "点单本", "同意书",
 }
 
 
@@ -437,7 +442,9 @@ def check_delivery(text: str, const: dict | None = None,
             who = cells[got.index("谁在画面")]
             for name in re.split(r"[、,，/／+＋和与\s]+", who):
                 name = name.strip("（）()【】[]")
-                if len(name) >= 2 and name not in WHO_STOP and not re.fullmatch(r"[\d.]+s?", name):
+                if (len(name) >= 2 and name not in WHO_STOP
+                        and not is_object_name(name)
+                        and not re.fullmatch(r"[\d.]+s?", name)):
                     used.add(name)
         for name in sorted(used):
             if name not in reg:
