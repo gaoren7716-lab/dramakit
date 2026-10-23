@@ -17,7 +17,7 @@ from pathlib import Path
 
 from common import (CONST, C, apply_form_profile, compliance_for, constants_for,
                     is_object_name, is_row, norm_head, normalize_form, platform_for,
-                    sizes_for, split_row)
+                    sizes_for, split_row, strip_body_part)
 from plan import ACTS, beats
 
 # 交付定稿的五块
@@ -491,6 +491,10 @@ def check_delivery(text: str, const: dict | None = None,
                 #   它逼人去改本来没写错的稿子。
                 name = re.sub(r"[（(][^）)]*[）)]", "", name).strip()
                 name = name.strip("（）()【】[]·・-")
+                # ★ 「李静的脖子」是同一个人。特写拍的就是局部，
+                #   不去掉部位会把「李静」和「李静的脖子」当成两个人。
+                #   只剥身体部位：「李静的丈夫」是另一个人，不能剥。
+                name = strip_body_part(name)
                 if (len(name) >= 2 and name not in WHO_STOP
                         and not is_object_name(name)
                         and not re.fullmatch(r"[\d.]+s?", name)):

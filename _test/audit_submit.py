@@ -21,7 +21,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "engine" / "lib"))
 
-from common import is_object_name, is_row, norm_head, split_row   # noqa: E402
+from common import (is_object_name, is_row, norm_head, split_row,   # noqa: E402
+                    strip_body_part)
 import scan as SC                                        # noqa: E402
 
 # 这些"谁在画面"是物件/群体/介质，不需要在人物表登记。
@@ -119,10 +120,16 @@ def _same_person(who: str, names: set[str]) -> bool:
 
     认三种等价：完全相同 / 去掉定语（`X的Y` → `Y`）/ 是某人名的**后缀**。
     ★ 后缀长度必须 ≥2：只留一个字的匹配会乱撞（「老王」和「王」不是一回事）。
+
+    第四种：**「某人的某部位」是同一个人**。特写拍的就是局部——
+    李静的脖子、孔乙己的腿、他的手。但只对**身体部位**成立，
+    「李静的丈夫」是另一个人，绝不能剥。
     """
     if who in names:
         return True
     if who.rsplit("的", 1)[-1] in names:
+        return True
+    if strip_body_part(who) in names:
         return True
     if len(who) >= 2:
         for n in names:
@@ -327,6 +334,18 @@ def selftest() -> int:
          not any(is_object_name(n) for n in ("张军", "李平", "王海", "刘伟", "陈明")),
          "军/平/海/伟/明 是常见人名尾字，不能判成物件")
     want("人名不是物件", not is_object_name("周长顺"), "「周长顺」是人")
+    # ★ 「某人的某部位」是同一个人。特写镜头拍的就是局部：
+    #   李静的脖子、孔乙己的腿、他的手。不去掉部位会被报成"两个没登记的人"。
+    want("身体部位归一", _same_person("李静的脖子", {"李静"})
+         and _same_person("孔乙己的腿", {"孔乙己"}),
+         "「X的部位」应认作 X")
+    # ★ 反向：只对**身体部位**成立。「李静的丈夫」是另一个人，
+    #   剥成「李静」等于把一个没登记的角色藏起来——比漏报更坏。
+    want("亲属定语不归一", not _same_person("李静的丈夫", {"李静"}),
+         "「李静的丈夫」不是李静")
+    # ★ 位置不是人。空镜里写「门口」表示门被推开，不是一个人叫门口。
+    want("位置不是人", is_object_name("门口") and is_object_name("柜台"),
+         "门口/柜台是位置，不该去人物表对账")
     want("单字不判物件", not is_object_name("书"), "单字不做后缀匹配")
     # ★ 「至」既是区间连接符又是普通汉字。踩过：道具写
     #   「健身卡（镜1、5、8、9），卡面印着有效期至2029年」，
