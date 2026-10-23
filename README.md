@@ -269,6 +269,7 @@ python engine/dramakit.py cliff 我的漫剧/第09集/分镜表.md
     ├── quality_corpus.json  # 质量评分卡的证伪语料（好稿/差稿 + 区间）
     ├── quality/             # 语料样本本身
     ├── audit_config_keys.py # config 键消费审计（查空转）
+    ├── audit_submit.py      # 提交版内部自洽（人物/场景/服装镜号互相对账，带 --selftest）
     ├── doccheck.py          # 文档对账（幽灵命令 / 数字谎言 / 形态名）
     └── plagiarism_probe.py  # 查重（长行 ≥40 字 / 中文短句 ≥18 汉字）
 ```
