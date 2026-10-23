@@ -1119,6 +1119,88 @@ def t_no_dead_config():
           f"门槛 {cf.get('cliff_score_min')} vs 基础满分 {base}")
 
 
+# ------------------------------------------------------------
+# U 老板提交模板 —— 全角竖线 ｜ / 目标时长 / 台词原文（无则写无）
+# ------------------------------------------------------------
+# 为什么单开一组：**格式也是一种写法**。
+# 模板换成全角竖线之后，解析器静默返回 0 个镜头、交付校验静默判"列头缺两列"，
+# 两种失败都不崩、都不报错——正是"判据静默失效"的典型。
+# 所以本组不只测"能过"，还要**注入必坏的输入**：少一列、跳一个镜号、写 999s，
+# 三条都必须红。只测"正常能过"的自检是假保护。
+
+BOSS_DOC = (
+    "# 测试剧\n\n"
+    "## 0. 状态\n\n定稿，不再改台词：是\n\n"
+    "## 1. 基本信息（一行一项）\n\n"
+    "剧名：测试剧\n类型 / 受众：测试 / 测试\n"
+    "画幅时长：竖屏9:16，约12秒，3镜\n风格二选一：真人\n结尾字幕原文：完。\n\n"
+    "## 2. 人物（每人4行，写死，内部不能矛盾）\n\n"
+    "姓名｜年龄｜身份：周宁｜30岁｜测试员\n"
+    "长相锁定：短发，左眉有疤\n服装锁定：灰衬衫（镜1至3，全片不换）\n贯穿道具：无\n\n"
+    "## 3. 场景（每场景一段）\n\n"
+    "地点｜时间｜光线｜桌上/环境固定物：出租屋｜夜｜冷白顶灯｜一张掉漆的桌子\n\n"
+    "## 4. 分镜表\n\n"
+    "镜号｜目标时长｜景别｜谁在画面｜动作一句话｜台词原文（无则写无）\n"
+    "01｜4s｜近景｜周宁｜他坐下，手撑着桌子｜无\n"
+    "02｜4s｜特写｜周宁｜他抬头看向门外｜有人吗？\n"
+    "03｜4s｜全景｜周宁｜他起身走向门口｜无\n\n"
+    "## 5. 验收与额度（一行定死）\n\n"
+    "重抽上限：每镜最多1次；锚定试镜（主角各1镜）我通过后才批量：是\n"
+    "失败处理：脸/服装/道具丢任一，停下报，不自动整批重做\n"
+)
+
+
+def t_boss_template():
+    shots = SC.parse_shotlist(BOSS_DOC)
+    check("全角竖线表解析出全部镜头", len(shots) == 3, f"解析到 {len(shots)} 镜")
+    check("「目标时长」认成秒数", shots and shots[0]["sec"] == 4.0,
+          str(shots[0]["sec"] if shots else None))
+    check("「台词原文（无则写无）」列被认出",
+          shots and shots[1]["line"] == "有人吗？",
+          str(shots[1]["line"] if shots else None))
+    check("「无」判为没台词", shots and not SC.has_line(shots[0]),
+          str(shots[0]["line"] if shots else None))
+    check("谁在画面没被全角竖线切碎",
+          shots and shots[0]["visual"].startswith("周宁"),
+          str(shots[0]["visual"] if shots else None))
+
+    res = SL.check_delivery(BOSS_DOC, form="live_action", is_ai=False)
+    check("老板模板整篇判为可发", res["ok"], "；".join(res["problems"]))
+
+    # —— 注入证伪三条：必须红 ——
+    # 1) 少一列（把台词列整列删掉）：列头必须报缺
+    broken = BOSS_DOC.replace(
+        "镜号｜目标时长｜景别｜谁在画面｜动作一句话｜台词原文（无则写无）",
+        "镜号｜目标时长｜景别｜谁在画面｜动作一句话")
+    broken = "\n".join(
+        "｜".join(ln.split("｜")[:5]) if ln[:2].isdigit() else ln
+        for ln in broken.splitlines())
+    r1 = SL.check_delivery(broken, form="live_action", is_ai=False)
+    check("注入·少一列被拦", not r1["ok"] and any("列头缺" in p for p in r1["problems"]),
+          str(r1["problems"]))
+
+    # 2) 跳一个镜号：1、3 —— 现场会让"第 2 镜"凭空消失
+    r2 = SL.check_delivery(BOSS_DOC.replace("02｜4s", "05｜4s"),
+                           form="live_action", is_ai=False)
+    check("注入·镜号不连续被拦", not r2["ok"] and any("镜号不连续" in p for p in r2["problems"]),
+          str(r2["problems"]))
+
+    # 3) 单镜 999 秒：正数、格式合法，但生成端出不来
+    r3 = SL.check_delivery(BOSS_DOC.replace("01｜4s", "01｜999s"),
+                           form="live_action", is_ai=False)
+    check("注入·超单镜上限被拦", not r3["ok"] and any("上限" in p for p in r3["problems"]),
+          str(r3["problems"]))
+
+    # markdown 表格里单元格内的全角竖线必须留着（一刀切会切碎「周宁｜推门」）
+    md = ("| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |\n"
+          "|---|---|---|---|---|---|\n"
+          "| 1 | 4s | 近景 | 周宁 | 推门｜回头看 | 有人吗 |\n")
+    s2 = SC.parse_shotlist(md)
+    check("markdown 单元格内的 ｜ 不被当分隔符",
+          len(s2) == 1 and "推门｜回头看" in s2[0]["visual"],
+          str(s2[0]["visual"] if s2 else None))
+
+
 CASES = [
     ("A 节拍配比", t_beats),
     ("B 分镜骨架", t_skeleton),
@@ -1140,6 +1222,7 @@ CASES = [
     ("R 断点续跑与站位", t_progress),
     ("S 判据不静默失效", t_no_silent_fail),
     ("T config 无空转", t_no_dead_config),
+    ("U 老板提交模板", t_boss_template),
 ]
 
 

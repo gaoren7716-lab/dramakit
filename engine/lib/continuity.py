@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from common import C
+from common import C, is_row, split_row
 
 # 台账四张表的标题关键词 → 内部键
 TABLES = {
@@ -70,11 +70,11 @@ def _rows(md: str, header_kw: str) -> list[dict]:
         s = ln.strip()
         if s.startswith("#") and s.lstrip("#").strip() and head is not None:
             break
-        if not s.startswith("|"):
+        if not is_row(s):
             if head is not None and data:
                 break
             continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
+        cells = split_row(s)
         if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
             continue                      # 分隔行
         if head is None:
@@ -120,9 +120,9 @@ def _shotshot_names(text: str) -> set:
     """
     names = set()
     for ln in text.splitlines():
-        if not ln.strip().startswith("|"):
+        if not is_row(ln):
             continue
-        cells = [c.strip() for c in ln.strip("|").split("|")]
+        cells = split_row(ln)
         if len(cells) < 4 or cells[0].lower() in ("镜",) or not cells[0].isdigit():
             continue
         # 第 4 列（索引 3）= 谁在画面；该列可能用"、"分隔多人

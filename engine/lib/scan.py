@@ -22,8 +22,8 @@ from collections import Counter
 from pathlib import Path
 
 from common import (CONST, C, apply_form_profile, bar, compliance_for,
-                    constants_for, model_for, normalize_form, platform_for,
-                    sizes_for)
+                    constants_for, is_row, model_for, norm_head, normalize_form,
+                    platform_for, sizes_for, split_row)
 
 D_ = CONST["drama"]
 DS_ = D_["single"]
@@ -136,13 +136,20 @@ def _norm_sec(v) -> float:
     return float(m.group(1)) if m else 0.0
 
 
+# ★ 全角竖线 ｜ 与半角 | 等价、列名末尾括注要剥掉——两条都在 common 里，
+#   因为交付校验（shotlist）与解析（scan）必须用同一套切法，
+#   两边各写一份就会各自漂移，最后一张表两种读法。
+#   踩过的坑：只认半角时，老板模板格式的表**解析成空列表**且不报错，
+#   scan 拿到 0 个镜头，全部判据"通过"。
+
+
 # 表头 → 字段。**按表头解析，不按列数**。
 # 踩过的坑：早先按列数分派（6 列=交付、7 列=工作），骨架表一加"开场站位"
 # 就变成 7 列，整张交付表被当成工作格式解析——列错位、判据全废，且不报错。
 # 加列是常态，列数不是身份，表头才是。
 _HEAD = {
     "镜": "no", "镜号": "no",
-    "时长": "sec", "秒": "sec",
+    "时长": "sec", "目标时长": "sec", "秒": "sec",
     "景别": "size",
     "运镜": "move", "镜头": "move", "机位": "move",
     "谁在画面": "who", "人物": "who",
@@ -191,7 +198,9 @@ def parse_shotlist(text: str) -> list[dict]:
     stripped = text.lstrip("\ufeff")
     shots = []
 
-    if not any(l.strip().startswith("|") for l in stripped.splitlines()):
+    # ★ 判"是不是 md 表格"不能只看半角 |。老板模板整篇没有外框竖线，
+    #   只看 | 会把它当 CSV 送去 csv.reader，然后一行都解析不出来。
+    if not any(is_row(l) for l in stripped.splitlines()):
         rows = [r for r in csv.reader(io.StringIO(stripped)) if r and len(r) >= 7]
         for r in rows:
             if not r[0].strip().isdigit():
@@ -208,14 +217,17 @@ def parse_shotlist(text: str) -> list[dict]:
     header, raw = None, []
     for line in stripped.splitlines():
         line = line.strip()
-        if not line.startswith("|"):
+        if not line:
             continue
-        cells = [c.strip() for c in line.strip("|").split("|")]
-        if not cells:
+        # 表格行：半角 | 开头，或者含全角 ｜（老板模板不带外框竖线）
+        if not (line.startswith("|") or "｜" in line):
+            continue
+        cells = split_row(line)
+        if len(cells) < 2:
             continue
         if header is None:
-            if cells[0] in ("镜", "镜号"):
-                header = cells
+            if norm_head(cells[0]) in ("镜", "镜号"):
+                header = [norm_head(c) for c in cells]
             continue
         if not cells[0].isdigit():
             continue

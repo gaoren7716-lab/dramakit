@@ -7,6 +7,7 @@ Python 3.11+（用到 tomllib）。
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -244,6 +245,53 @@ def find_project_root(path, levels: int = 4):
             break
         p = p.parent
     return None
+
+
+# ------------------------------------------------------------
+# 表格行切分
+# ------------------------------------------------------------
+# ★ 全角竖线 ｜ 是**另一种写法**，不是半角 | 的别名。
+#   老板的提交模板是这么写的：`镜号｜目标时长｜景别｜谁在画面｜…`
+#   —— 没有外框竖线，分隔符是全角。只认半角会让整张表**解析成空列表**，
+#   而且不报错：scan 拿到 0 个镜头，所有判据"全部通过"。
+#   这是"按符号查表"的又一例：分隔符也是一种写法，写法不止一种。
+
+# 列名后缀的括注是**给人看的填表说明**，不是列名的一部分。
+# 老板模板的末列叫「台词原文（无则写无）」——不剥掉就认不出这一列，
+# 整列台词被判成"缺失"，所有"有台词"的判据一起失效。
+_PAREN = re.compile(r"[（(][^）)]*[）)]\s*$")
+
+
+def split_row(line: str) -> list[str]:
+    """切一行表格。**两种写法各用各的分隔符，不能混**：
+
+    - Markdown 表格：行首有半角外框 `|`，按半角 `|` 切。
+      单元格内部可以合法出现全角 `｜`（如「周宁｜推门」），**必须留着**。
+    - 老板提交模板：没有外框竖线，整行按全角 `｜` 切。
+
+    ★ 一刀切按"两种竖线都算分隔符"会切碎单元格：
+      实测「周宁｜推门」被切成两格，整张表右移一列，
+      台词列读到的是画面内容，而且**不报错**——错的解析比失败的解析更坏。
+    """
+    s = line.strip()
+    if not s:
+        return []
+    if s.startswith("|"):                 # markdown 表格：外框半角
+        return [c.strip() for c in s.strip("|").split("|")]
+    if "｜" in s:                          # 老板模板：全角竖线，无外框
+        return [c.strip() for c in s.strip("｜").split("｜")]
+    return []
+
+
+def is_row(line: str) -> bool:
+    """这一行像不像表格行：半角 | 开头，或含全角 ｜。"""
+    s = line.strip()
+    return s.startswith("|") or "｜" in s
+
+
+def norm_head(h: str) -> str:
+    """把列名归一成短名：剥掉末尾括注。"""
+    return _PAREN.sub("", (h or "").strip()).strip()
 
 
 # ------------------------------------------------------------

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 
-from common import C
+from common import C, is_row, split_row
 
 # 结尾镜的"钩子词"：台词里有这些，说明这一句不是陈述，是悬着的一口气。
 # ★ 词表要收**实际会写出来的说法**，不是理论分类。
@@ -198,9 +198,9 @@ def _parse_episode_table(text: str) -> tuple[list[dict], str]:
     rows = []
     header = []
     for line in text.splitlines():
-        if not line.startswith("|"):
+        if not is_row(line):
             continue
-        cells = [c.strip() for c in line.strip("|").split("|")]
+        cells = split_row(line)
         if set("".join(cells)) <= {"-", ":"}:
             continue
         if not header:

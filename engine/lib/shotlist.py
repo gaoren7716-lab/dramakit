@@ -16,16 +16,32 @@ import re
 from pathlib import Path
 
 from common import (CONST, C, apply_form_profile, compliance_for, constants_for,
-                    normalize_form, platform_for, sizes_for)
+                    is_row, norm_head, normalize_form, platform_for, sizes_for,
+                    split_row)
 from plan import ACTS, beats
 
 # 交付定稿的五块
 BLOCKS = ["基本信息", "人物表", "场景", "分镜表", "验收额度"]
+# ★ 同一块可以有多个名字——**块名也是写法**。
+#   老板的提交模板写的是「## 2. 人物」「## 5. 验收与额度」，
+#   只认「人物表」「验收额度」会把他照模板填的稿子判成"缺两块"，
+#   而这两块明明都在。判据要认实际写法，不是认我当初起的名。
+#   注意：别名只加"真同义"，不做到模糊匹配——五块结构是硬约束，
+#   放宽成"沾边就算"就等于取消这道闸门。
+BLOCK_ALIASES = {
+    "人物表": ("人物表", "人物"),
+    "验收额度": ("验收额度", "验收与额度", "验收"),
+}
 COLUMNS = ["镜", "时长", "景别", "谁在画面", "动作一句话", "台词原文"]
 # 漫画/动漫向（有"格"的形态）的交付列头：把"动作一句话"换成"画面一句话"，
 # "台词原文"换成"气泡对白"——不是改名游戏，是两类交付物确实不同：
 # 视频交付要的是"能演的动作"，漫画交付要的是"能画的画面 + 装得下的气泡"。
 COMIC_COLUMNS = ["镜", "时长", "景别", "谁在画面", "画面一句话", "气泡对白"]
+
+# 列名别名：老板提交模板写的是「镜号｜目标时长｜…」，语义与「镜｜时长」同一列。
+# ★ 别名只收**真同义**的说法，不做模糊匹配——列头校验的价值就在于"写错要报"，
+#   放宽成"看起来像就算对"，这道闸门就废了。
+_COL_ALIAS = {"镜号": "镜", "目标时长": "时长"}
 
 # 工作表的列头（骨架表）。**和交付列头是两套东西，别混**：
 # 交付表是给人看和拍的，工作表现在还要能喂给 scan（运镜/声音）与
@@ -196,8 +212,10 @@ def _check_body(text: str, header: list[str], const: dict | None = None,
     lines = text.splitlines()
     hidx = None
     for i, ln in enumerate(lines):
-        cells = [c.strip() for c in ln.strip().strip("|").split("|")] if ln.strip().startswith("|") else []
-        if cells and cells[0] in ("镜", "镜号") and "时长" in cells:
+        if not (ln.strip().startswith("|") or "｜" in ln):
+            continue
+        cells = [norm_head(c) for c in split_row(ln)]
+        if cells and cells[0] in ("镜", "镜号") and any(c in ("时长", "目标时长") for c in cells):
             hidx = i
             break
     if hidx is None:
@@ -206,11 +224,11 @@ def _check_body(text: str, header: list[str], const: dict | None = None,
     rows = []
     for ln in lines[hidx + 1:]:
         s = ln.strip()
-        if not s.startswith("|"):
+        if not (s.startswith("|") or "｜" in s):
             if rows:
                 break           # 表体结束
             continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
+        cells = split_row(s)
         if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
             continue             # 分隔行
         rows.append(cells)
@@ -314,18 +332,24 @@ def check_delivery(text: str, const: dict | None = None,
     frm = normalize_form(form or d.get("form") or "live_action")
     # 标题允许带序号（"## 一、基本信息"），也允许不带（"## 基本信息"）
     def _has_block(name: str) -> bool:
-        pat = rf"^#+\s*(?:[一二三四五六七八九十]+\s*[、.．]\s*)?{re.escape(name)}"
-        return bool(re.search(pat, text, re.M))
+        for alias in BLOCK_ALIASES.get(name, (name,)):
+            pat = rf"^#+\s*(?:[一二三四五六七八九十\d]+\s*[、.．]?\s*)?{re.escape(alias)}"
+            if re.search(pat, text, re.M):
+                return True
+        return False
 
     missing = [b for b in BLOCKS if not _has_block(b)]
 
     head = ""
-    m = re.search(r"^\|.*\|\s*$", text, re.M)
     for line in text.splitlines():
-        if line.startswith("|") and "镜" in line and "时长" in line:
-            head = line
+        s = line.strip()
+        if not (s.startswith("|") or "｜" in s):
+            continue
+        cells = [norm_head(c) for c in split_row(s)]
+        if cells and cells[0] in ("镜", "镜号") and any(c in ("时长", "目标时长") for c in cells):
+            head = s
             break
-    got = [c.strip() for c in head.strip("|").split("|")] if head else []
+    got = [_COL_ALIAS.get(norm_head(c), norm_head(c)) for c in split_row(head)] if head else []
     bad_cols = [c for c in cols if c not in got]
 
     # ★ 表体核对：数据行、镜号连续、时长合法
@@ -334,7 +358,7 @@ def check_delivery(text: str, const: dict | None = None,
     # 验收额度必须落在"每镜几次 + 失败怎么办"这两件事上。
     # 用词分两种：AI 生成叫"重抽"，真人实拍叫"拍几条"，两种都认。
     quota_text = ""
-    mq = re.search(r"^#+\s*(?:[一二三四五六七八九十]+\s*[、.．]\s*)?验收额度\s*$(.*?)(?=^#|\Z)",
+    mq = re.search(r"^#+\s*(?:[一二三四五六七八九十\d]+\s*[、.．]?\s*)?验收(?:与)?额度[^\n]*$(.*?)(?=^#|\Z)",
                    text, re.M | re.S)
     if mq:
         quota_text = mq.group(1)
@@ -352,7 +376,7 @@ def check_delivery(text: str, const: dict | None = None,
     asset_block = d.get("asset") or {}
     asset_missing = False
     if asset_block.get("scene_bible_required") and frm in PANEL_FORMS:
-        msc = re.search(r"^#+\s*(?:[一二三四五六七八九十]+\s*[、.．]\s*)?场景\s*$(.*?)(?=^#|\Z)",
+        msc = re.search(r"^#+\s*(?:[一二三四五六七八九十\d]+\s*[、.．]?\s*)?场景[^\n]*$(.*?)(?=^#|\Z)",
                         text, re.M | re.S)
         body = msc.group(1) if msc else ""
         # 场景块要有表（| 或 粗体条目），不能只有一句"某地。"
@@ -368,15 +392,18 @@ def check_delivery(text: str, const: dict | None = None,
     cc = asset_block.get("consistency_check") or []
     if "角色" in cc and got and "谁在画面" in got:
         reg_block = re.search(
-            r"^#+\s*(?:[一二三四五六七八九十]+\s*[、.．]\s*)?人物表\s*$(.*?)(?=^#|\Z)",
+            r"^#+\s*(?:[一二三四五六七八九十\d]+\s*[、.．]?\s*)?(?:人物表|人物)[^\n]*$(.*?)(?=^#|\Z)",
             text, re.M | re.S)
         reg = reg_block.group(1) if reg_block else ""
         used = set()
         for line in text.splitlines():
-            if not line.startswith("|"):
+            if not is_row(line):
                 continue
-            cells = [c.strip() for c in line.strip("|").split("|")]
-            if len(cells) != len(got) or cells[0] in ("镜", "---") or set(cells[0]) <= {"-"}:
+            cells = split_row(line)
+            # ★ 只认"以数字开头"的数据行。表头行本身也是一行表格，
+            #   不排掉它，"谁在画面"这四个字会被当成一个演员名报出来
+            #   ——「分镜表出场但人物表未见登记：谁在画面」这种鬼话就是这么来的。
+            if len(cells) != len(got) or not cells[0].isdigit():
                 continue
             who = cells[got.index("谁在画面")]
             for name in re.split(r"[、,，/／+＋和与\s]+", who):
