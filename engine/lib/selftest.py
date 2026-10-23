@@ -902,6 +902,42 @@ def t_no_silent_fail():
         nm |= QL._who_names(_s)
     check("占位不当人名（空镜/两人不计数）", nm == {"周宁"}, str(nm))
 
+    # 7b) 定语归一：「床上的父亲」是一个人物，不是两个（v0.6.1）
+    check("定语归一：床上的父亲 → 父亲",
+          QL._who_names({"visual": "床上的父亲｜他躺着"}) == {"父亲"},
+          str(QL._who_names({"visual": "床上的父亲｜他躺着"})))
+    check("定语归一：一楼的父亲 → 父亲",
+          QL._who_names({"visual": "一楼的父亲｜他躺着"}) == {"父亲"})
+    check("多人并列仍分开计",
+          QL._who_names({"visual": "周宁 · 母亲｜他们站着"}) == {"周宁", "母亲"},
+          str(QL._who_names({"visual": "周宁 · 母亲｜他们站着"})))
+
+    # 7c) 位置词不能当场景（v0.6.1）：门前还是楼道，床边还是卧室
+    pos_only = ("| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |\n"
+                "|---|---|---|---|---|---|\n"
+                "| 1 | 3s | 中景 | 周宁 | 他站在门前 | 我在 |\n"
+                "| 2 | 3s | 中景 | 周宁 | 他坐在床边 | 你走 |\n"
+                "| 3 | 3s | 中景 | 周宁 | 他靠在窗前 | 别走 |\n")
+    dp_pos = QL.dim_places(SC.parse_shotlist(pos_only), "", QL.ST_)
+    check("位置词不当场景（门前/床边/窗前）", dp_pos["score"] == 0,
+          f"{dp_pos['score']}/{dp_pos['max']} {dp_pos.get('detail', '')}")
+    # 换成真空间名就必须拿分
+    real_place = (pos_only.replace("门前", "楼道").replace("床边", "卧室")
+                  .replace("窗前", "客厅"))
+    dp_real = QL.dim_places(SC.parse_shotlist(real_place), "", QL.ST_)
+    check("真空间名拿满分", dp_real["score"] == dp_real["max"],
+          f"{dp_real['score']}/{dp_real['max']} {dp_real.get('detail', '')}")
+
+    # 7d) 事件词表要收"实际会写出来的说法"（v0.6.1）
+    #     词表收"关门"，剧本写"把门带上"——对不上就静默失灵。
+    for phrase in ("把门带上", "门开了一条缝", "低头看了一眼", "手还举着"):
+        one = ("| 镜 | 时长 | 景别 | 谁在画面 | 动作一句话 | 台词原文 |\n"
+               "|---|---|---|---|---|---|\n"
+               f"| 1 | 3s | 中景 | 周宁 | {phrase} | — |\n")
+        de = QL.dim_events(SC.parse_shotlist(one), QL.ST_)
+        check(f"事件词认得「{phrase}」", de["score"] > 0,
+              f"{de['score']} {de.get('detail', '')}")
+
     # 8) 交付表体必须查：表头对 ≠ 稿子对
     good = _delivery_ok()
     ok_res = SL.check_delivery(good, CONST, form="live_action", is_ai=True)

@@ -50,7 +50,7 @@ python engine/dramakit.py forms    # 列全部形态与判据差异
 | `dramakit quality` | 故事质量评分卡：五维结构特征参考分（**不拦稿**） |
 | `dramakit progress` | 看项目做到哪一步：哪步做完、产物改没改、下一步干什么 |
 | `dramakit cliff` | 卡点评分：结尾镜值不值得让人掏钱（百分制，可批量比对） |
-| `dramakit selftest` | 153 项回归断言（20 组用例），秒级，不耗 token |
+| `dramakit selftest` | 162 项回归断言（20 组用例），秒级，不耗 token |
 | `dramakit doctor` | 环境自检：Python 版本 / 配置能不能读 / 目录齐不齐 |
 
 ## 不能做什么
